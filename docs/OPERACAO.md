@@ -1,7 +1,7 @@
 # Operação
 
 O caminho padrão é o script `./wa-bridge` (`setup`, `start`, `stop`, `status`, `logs`,
-`open`, `qr`, `pair`, `mcp-config`, `doctor`). Este documento cobre o resto: rodar como
+`service`, `open`, `qr`, `pair`, `mcp-config`, `doctor`). Este documento cobre o resto: rodar como
 serviço (launchd/systemd), Docker, pareamento, troubleshooting, backup e reset.
 
 > **Script nativo, serviço e Docker são formas EXCLUDENTES de rodar o wa-bridge, nunca
@@ -145,68 +145,45 @@ O `./wa-bridge start` já se recusa a subir se houver container de pé.
 
 ## Rodando como serviço no macOS (launchd)
 
-Crie `~/Library/LaunchAgents/local.wa-bridge.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>local.wa-bridge</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/node</string>
-    <string>/caminho/absoluto/para/wa-bridge/daemon/dist/index.js</string>
-  </array>
-
-  <key>WorkingDirectory</key>
-  <string>/caminho/absoluto/para/wa-bridge/daemon</string>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>WA_BRIDGE_HOME</key>
-    <string>/Users/SEU_USUARIO/.wa-bridge</string>
-    <key>WA_BRIDGE_PORT</key>
-    <string>7788</string>
-    <key>LOG_LEVEL</key>
-    <string>info</string>
-    <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-  </dict>
-
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-
-  <key>StandardOutPath</key>
-  <string>/Users/SEU_USUARIO/.wa-bridge/logs/launchd.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/SEU_USUARIO/.wa-bridge/logs/launchd.err.log</string>
-</dict>
-</plist>
+```bash
+./wa-bridge service install     # instala (ou atualiza) e sobe; para antes o daemon do script
+./wa-bridge service status      # carregado?, caminho do plist e do Node que vai rodar
+./wa-bridge service uninstall   # para e remove; o daemon não sobe mais sozinho
 ```
 
-Ajuste o caminho de `node` (`which node`; precisa ser Node 24+), o caminho absoluto do
-repo e `SEU_USUARIO` antes de instalar. Pare o script nativo antes (`./wa-bridge stop`):
-os dois juntos derrubam a sessão. Rode `./wa-bridge setup` antes de registrar o serviço — o `.plist` acima aponta para
-`daemon/dist/index.js`, não para o modo `tsx watch` de desenvolvimento.
-
-Comandos (forma moderna, não `load`/`unload`):
+O `install` grava `~/Library/LaunchAgents/local.wa-bridge.plist` (`RunAtLoad` e
+`KeepAlive`: sobe no login e reinicia se cair). Instância com outra porta ganha o rótulo
+`local.wa-bridge.<porta>`, então cada número tem o seu serviço:
 
 ```bash
-# instalar e iniciar
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.wa-bridge.plist
-
-# reiniciar depois de uma mudança de código/env
-launchctl kickstart -k gui/$(id -u)/local.wa-bridge
-
-# parar e desregistrar
-launchctl bootout gui/$(id -u)/local.wa-bridge
+WA_BRIDGE_HOME=~/.wa-bridge-trabalho WA_BRIDGE_PORT=7789 ./wa-bridge service install
 ```
+
+O plist não chama o `node` direto: chama `bin/wa-bridge-daemon`, que a cada boot
+
+- resolve um Node 24+ sem depender do PATH (o mesmo `resolve-node.sh` do shim MCP), então
+  trocar de versão no nvm não quebra o serviço;
+- lê o `.env` da raiz, que o launchd não leria sozinho. Mudou o `.env`? Rode
+  `./wa-bridge restart`.
+
+**Com o serviço instalado, o script vira controle remoto do launchd:**
+
+| Comando | O que faz com o serviço |
+|---|---|
+| `./wa-bridge start` | carrega o serviço (`bootstrap`) ou garante o processo de pé (`kickstart`) |
+| `./wa-bridge stop` | descarrega (`bootout`); volta no próximo login ou com `start` |
+| `./wa-bridge restart` | `kickstart -k`: o próprio launchd encerra e sobe de novo |
+| `./wa-bridge status` / `doctor` | mostram `serviço: launchd (local.wa-bridge)` |
+
+O script nunca sobe um processo próprio ao lado do serviço. Isso importa porque o daemon
+abre a conexão com o WhatsApp antes de ocupar a porta: um segundo processo chegaria a
+iniciar a sessão antes de falhar, e duas sessões na mesma credencial derrubam a conta com
+`device_removed`. Continua valendo: não rode `npm run dev` nem o Docker junto.
+
+Depois de mudar o código: `npm run build` e `./wa-bridge restart`.
+
+Logs do serviço: `~/.wa-bridge/logs/daemon.log` (o principal), mais `launchd.out.log` e
+`launchd.err.log` (o `./wa-bridge logs` acompanha os três).
 
 ## Rodando como serviço no Linux (systemd, usuário)
 

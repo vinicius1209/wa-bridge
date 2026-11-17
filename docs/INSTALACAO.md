@@ -151,9 +151,16 @@ instrução). Pergunte ao humano onde referenciar:
 
 ## 8. (Opcional) Subir sozinho ao ligar o computador
 
-Por padrão o daemon não volta depois de reiniciar a máquina. Se o humano quiser, siga
-`docs/OPERACAO.md`: launchd no macOS, systemd no Linux. **Pare o script antes**
-(`./wa-bridge stop`): serviço e script juntos derrubam a sessão.
+Por padrão o daemon não volta depois de reiniciar a máquina. Se o humano quiser:
+
+- **macOS**: `./wa-bridge service install`. O comando para o daemon do script, registra
+  o serviço no launchd (sobe no login, reinicia se cair) e espera ele responder. Depois
+  disso `start`, `stop` e `restart` falam com o launchd.
+- **Linux**: siga a seção do systemd em `docs/OPERACAO.md`. **Pare o script antes**
+  (`./wa-bridge stop`): serviço e script juntos derrubam a sessão.
+
+**Verificação (macOS):** `./wa-bridge status` mostra `serviço: launchd (local.wa-bridge)`
+e `whatsapp: conectado`.
 
 ## 9. Teste final (só leitura)
 

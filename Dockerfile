@@ -109,6 +109,9 @@ WORKDIR /app
 # isso o dashboard precisa estar em /app/dashboard, irmão de /app/daemon.
 COPY --from=deps /app/daemon/dist daemon/dist
 COPY --from=deps /app/daemon/package.json daemon/package.json
+# A versão do wa-bridge mora só no package.json da raiz (daemon/src/version.ts
+# lê `../../package.json` a partir de dist/), então ele vem junto.
+COPY package.json package.json
 # `npm ci` roda num workspace (raiz referencia daemon/ e mcp/), então o npm
 # hoisteia as deps de produção para /app/node_modules em vez de
 # /app/daemon/node_modules. A resolução ESM do Node sobe diretórios em busca
