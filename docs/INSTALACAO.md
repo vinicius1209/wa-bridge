@@ -136,7 +136,7 @@ printf '%s\n%s\n%s\n' \
  | ./bin/wa-bridge-mcp | grep -o '"name":"wa_[a-z_]*"' | sort -u | wc -l
 ```
 
-Deve imprimir `14`.
+Deve imprimir `16`.
 
 ## 7. Ensinar o agente a usar
 
