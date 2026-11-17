@@ -1150,6 +1150,25 @@ export class WhatsAppConnection {
     const socket = this.requireSocket();
     await this.ensurePresenceSubscribed(socket, chatJid);
     await socket.sendPresenceUpdate(p, chatJid);
+    // Todo envio termina em `paused`: é aqui que a conta volta a ficar offline.
+    if (p === 'paused') await this.markUnavailable(socket);
+  }
+
+  /**
+   * Avisa o WhatsApp de novo que este aparelho está offline (`unavailable`).
+   *
+   * Enviar, "digitar", reagir, editar, apagar ou marcar como lido faz o servidor tratar o
+   * aparelho como em uso, e enquanto isso o celular do usuário para de notificar. O aviso
+   * da conexão (`markOnlineOnConnect: false`) vale só até a primeira ação; sem repetir
+   * depois de cada uma, o celular ficava sem notificação até o próximo restart. Melhor
+   * esforço: falhar aqui não desfaz a ação que já saiu.
+   */
+  private async markUnavailable(socket: WASocket): Promise<void> {
+    try {
+      await socket.sendPresenceUpdate('unavailable');
+    } catch (error) {
+      this.log.warn({ error }, 'falha ao avisar que o aparelho está offline; o celular pode não notificar');
+    }
   }
 
   /**
@@ -1178,7 +1197,10 @@ export class WhatsAppConnection {
     // A última mensagem pode ser nossa, e "ler" a própria mensagem não marca nada no
     // WhatsApp. Procuramos a última que veio de outra pessoa.
     const last = this.store.listMessages({ chatJid, limit: 50 }).find((m) => !m.fromMe);
-    if (last) await socket.readMessages([this.keyFor(chatJid, last.id, false)]);
+    if (last) {
+      await socket.readMessages([this.keyFor(chatJid, last.id, false)]);
+      await this.markUnavailable(socket);
+    }
     // O contador local é acumulativo (ver `Store.upsertChat`); marcar como lido tem que zerá-lo,
     // senão `listChats({ onlyUnread: true })` continua devolvendo o chat para sempre.
     this.store.clearUnread(chatJid);
@@ -1190,6 +1212,7 @@ export class WhatsAppConnection {
     const message = this.store.getMessage(messageId);
     const key = this.keyFor(chatJid, messageId, message?.fromMe ?? false);
     await socket.sendMessage(chatJid, { react: { text: emoji, key } });
+    await this.markUnavailable(socket);
   }
 
   /**
@@ -1204,6 +1227,7 @@ export class WhatsAppConnection {
     // ficaria vendo "Aguardando mensagem".
     if (result?.key.id && result.message) this.rawMessages.set(result.key.id, result.message);
     this.applyChange(this.ownChange('edit', chatJid, messageId, text));
+    await this.markUnavailable(socket);
   }
 
   /** Apaga para todos uma mensagem enviada pelo usuário e aplica a exclusão no banco. */
@@ -1213,6 +1237,7 @@ export class WhatsAppConnection {
     const result = await socket.sendMessage(chatJid, { delete: key });
     if (result?.key.id && result.message) this.rawMessages.set(result.key.id, result.message);
     this.applyChange(this.ownChange('revoke', chatJid, messageId, null));
+    await this.markUnavailable(socket);
   }
 
   /** `MessageChange` de uma edição ou exclusão feita pelo próprio daemon. */
