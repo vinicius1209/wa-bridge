@@ -177,15 +177,23 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
 
   // ------------------------------------------------------------------ rotas
 
-  /** GET /health — único endpoint sem auth; usado por monitoramento/launchd e pela identidade do painel. */
-  app.get('/health', async () => ({
-    ok: true,
-    version: config.version,
-    session: wa.getSessionState(),
-    // Sem token de propósito: o painel precisa saber de qual número é antes do login.
-    // Só rótulo, cor e o caminho do token (nunca o token em si).
-    account: config.account,
-  }));
+  /**
+   * GET /health: único endpoint sem auth; usado por monitoramento, pelo script e pela
+   * identidade do painel. Qualquer processo da máquina lê isto, então só vai o mínimo:
+   * o estado da sessão sem o número da conta (`me`), sem o QR e sem o último erro (esses
+   * ficam em `/session`, com token).
+   */
+  app.get('/health', async () => {
+    const session = wa.getSessionState();
+    return {
+      ok: true,
+      version: config.version,
+      session: { state: session.state, since: session.since },
+      // Sem token de propósito: o painel precisa saber de qual número é antes do login.
+      // Só rótulo, cor e o caminho do token (nunca o token em si).
+      account: config.account,
+    };
+  });
 
   /** GET /session — estado completo da sessão Baileys, incl. QR quando pareando. */
   app.get('/session', async () => wa.getSessionState());

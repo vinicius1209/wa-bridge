@@ -44,6 +44,12 @@ const SENTENCE_BOUNDARY_RE = /[.!?…]+[)"'”’]*\s+(?=[\p{L}\p{N}"'“(])/gu;
  */
 const ABBREV_BEFORE_RE =
   /(?:^|[\s(])(?:sr|sra|srta|dr|dra|prof|profa|etc|ex|vs|obs|aprox|num|núm|pag|pág|fig|art|av|cia|ltda|jr|tel|cel|est|\p{L})[.!?…]+[)"'”’]*\s*$/iu;
+/**
+ * Marcador de lista numerada no começo da linha ("1. Arroz"). O ponto dele não encerra
+ * frase: cortar ali deixaria o número num bubble e o item no seguinte. Só no começo da
+ * linha, para "o jogo é às 20. Leva bola" continuar sendo fronteira.
+ */
+const LIST_MARKER_BEFORE_RE = /(?:^|\n)[ \t]*\d{1,3}\.\s*$/u;
 // pontuação "forte" o suficiente para justificar split mesmo em texto curto.
 const STRONG_PUNCT_RE = /[.!?…]\s|[.!?…]$/u;
 
@@ -137,9 +143,10 @@ export function splitBubbles(text: string): string[] {
 
   const sentenceBoundaries: number[] = [];
   for (const match of fullyMasked.matchAll(SENTENCE_BOUNDARY_RE)) {
-    // Descarta fronteira que na verdade é abreviação ou inicial ("etc. e tal").
+    // Descarta fronteira que na verdade é abreviação ou inicial ("etc. e tal"), ou o
+    // marcador de um item de lista numerada.
     const before = fullyMasked.slice(0, match.index + match[0].length);
-    if (ABBREV_BEFORE_RE.test(before)) continue;
+    if (ABBREV_BEFORE_RE.test(before) || LIST_MARKER_BEFORE_RE.test(before)) continue;
     sentenceBoundaries.push(match.index + match[0].length);
   }
 

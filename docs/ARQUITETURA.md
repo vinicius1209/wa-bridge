@@ -85,7 +85,10 @@ instância, cada uma com `WA_BRIDGE_HOME` e `WA_BRIDGE_PORT` próprios. `account
 é só leitura (lido no boot); inválido falha o boot. `label` aparece no painel,
 `description` vira a instrução do servidor MCP, `color` (`#rrggbb`) é o destaque do painel.
 
-Nada fora de `WA_BRIDGE_HOME` é escrito em runtime.
+Nada fora de `WA_BRIDGE_HOME` é escrito em runtime. No boot o daemon aplica `chmod 700`
+em `WA_BRIDGE_HOME` e em `auth/` (`restrictStateDirs`), porque `mkdir` com `mode` só vale
+para pasta nova e o script cria a pasta antes; se o chmod for recusado (bind-mount do
+Docker), vira aviso no log, nunca falha de boot.
 
 ## Env vars (nomes exatos)
 
@@ -202,6 +205,7 @@ export interface MentionPreview {
 export class WhatsAppConnection {
   constructor(deps: { store: Store; log: Logger; metrics: Metrics; home: string });
   connect(): Promise<void>;
+  close(): void;                            // desligamento: sem reconexão e SEM logout
   getSessionState(): SessionState;          // { state, me, qrDataUrl, since }
   forcePair(): Promise<void>;               // derruba e gera QR novo
   onMessage(cb: (m: StoredMessage, raw: WAMessageContent) => void): void;
@@ -219,6 +223,23 @@ export class WhatsAppConnection {
 }
 ```
 
+Entrada de mensagens, por origem:
+
+- **ao vivo** (`messages.upsert` com `notify`): `upsertMessage`, soma em não lidas,
+  dispara `onMessage`.
+- **fila offline** (`messages.upsert` com `append`): o que ficou no servidor enquanto o
+  daemon estava fora, entregue na reconexão. Antes era descartado. Entra com
+  `insertMessageIfNew` (repetida não duplica nem soma de novo), soma em não lidas e
+  dispara `onMessage`.
+
+O timestamp pode vir como `Long`; a conversão usa o `toNumber` do Baileys (com
+`Number()` cru a mensagem ficava com a hora em que foi gravada).
+
+`getMessage` (exigido pelo Baileys para reenviar uma mensagem quando o destinatário pede
+retry, e para decifrar voto de enquete) devolve o conteúdo do cache em memória ou do
+`raw_json`, com os campos `{ type: 'Buffer', data }` revividos como `Buffer`. Devolver
+`undefined` deixava o destinatário vendo "Aguardando mensagem".
+
 O unwrap de view-once cobre `viewOnceMessageV2`, `viewOnceMessage` e
 `viewOnceMessageV2Extension`. Reação e confirmação de leitura usam a `key` completa
 guardada em `raw_json` (em grupo, sem o `participant` elas não pegam no app).
@@ -229,7 +250,9 @@ guardada em `raw_json` (em grupo, sem o `participant` elas não pegam no app).
 export class Store {
   constructor(dbPath: string);
   migrate(): void;
-  upsertMessage(m: StoredMessage, rawJson: string): void;
+  close(): void;
+  upsertMessage(m: StoredMessage, rawJson: string): void;   // não "desprocessa" media_state
+  insertMessageIfNew(m: StoredMessage, rawJson: string): boolean;   // fila offline
   listChats(opts: { limit: number; onlyUnread: boolean }): ChatSummary[];
   listMessages(opts: { chatJid: string; limit: number; since?: number }): StoredMessage[];
   getMessage(id: string): StoredMessage | null;
@@ -250,7 +273,17 @@ export class Store {
 }
 ```
 
+`upsertContact` só avança `last_inbound_at`/`last_outbound_at` (uma mensagem antiga que
+chega depois de uma nova não recua o último contato, que é o que o gate usa para
+`NEVER_CONTACTED`).
+`upsertMessage` preserva `media_state` já `ready`/`failed`/`expired` numa reentrega da
+mesma mensagem.
+
 `resolveContact` retorna lista **ordenada por confiança** com `score` e `reason`.
+Em modo número, casa também pelo `phone_jid` (contato LID achado pelo telefone real). Se
+a mesma pessoa casar duas vezes, pelo JID de telefone e pelo LID cujo `phone_jid` é esse
+telefone, fica só o de telefone: não é ambiguidade, e devolver os dois faria o gate
+recusar com `AMBIGUOUS_CONTACT`.
 Nunca retorne um único match implicitamente: ambiguidade é informação que o gate usa.
 `resolveGroupParticipant` segue a mesma regra, mas **escopada ao grupo**: resolver
 "Allan" globalmente acharia outro Allan, e mencionar quem não é do grupo é vazamento.
@@ -334,7 +367,8 @@ que não notifica ninguém. Regras:
 
 - `applyMentionPlaceholders` roda **antes** de `splitBubbles`, no `draft()`: ele muda
   o texto, e o preview tem que mostrar o que vai sair de verdade.
-- Se o agente escreveu `@Allan`, troca esse token pelo número; senão prefixa.
+- Se o agente escreveu `@Allan`, troca esse token pelo número; senão prefixa. Ponto e
+  hífen só fazem parte do nome no meio (`@ana-maria`); no fim são pontuação (`@Allan.`).
 - `mentionsForChunk` por bubble: cada mensagem leva só as menções cujo `@<dígitos>`
   aparece nela. Diferente da citação, menção **não** se consome no primeiro bubble.
 - Placeholder casa com lookahead `(?!\d)` — `@5551999` não pode casar dentro de
@@ -364,7 +398,8 @@ aborto; não documente como proteção contra banimento):
   proporcionalmente em vez de truncar texto
 - `shouldAbort()` é consultado antes de CADA bubble — é o que faz `wa_cancel` funcionar
 - split em 2–4 bubbles por fronteira de sentença; nunca corte no meio de palavra,
-  URL, bloco de código ou emoji (cuidado com surrogate pairs)
+  URL, bloco de código ou emoji (cuidado com surrogate pairs), nem entre o número e o
+  item de uma lista numerada no começo da linha (`1. Arroz`)
 
 ### `daemon/src/obs/`
 
@@ -389,6 +424,12 @@ export class Audit {
 Redaction obrigatória no logger: nunca logue o conteúdo do token, credenciais
 Baileys, nem corpo completo de mensagem em nível `info` (texto só em `debug`).
 Todo log carrega `traceId`, e todo request HTTP gera um `traceId` propagado.
+
+### Desligamento (`index.ts`)
+
+SIGTERM/SIGINT: `api.close()` → `wa.close()` (socket encerrado sem logout, sem reconexão) →
+`metrics.flush()` → `store.close()` → `exit(0)`. Teto de 8s; passou disso, sai com 1.
+Envios interrompidos viram falha no próximo boot (`failOrphanSends`).
 
 ## Schema SQLite (exato)
 
@@ -450,7 +491,7 @@ Toda resposta de erro: `{ error: { code: string, message: string, detail?: unkno
 
 | Método | Rota | Body / Query | Resposta |
 |---|---|---|---|
-| GET | `/health` | — | `{ ok, version, session, account }` (`account`: `{ label, description, color, tokenPath }`, nunca o token) |
+| GET | `/health` | — | `{ ok, version, session: { state, since }, account }` (`account`: `{ label, description, color, tokenPath }`, nunca o token). Sem token, então sem `me`, QR nem `lastError`: esses ficam em `/session` |
 | GET | `/session` | — | `SessionState` com `qrDataUrl` quando pareando |
 | POST | `/session/pair` | — | `{ started: true }` |
 | GET | `/chats` | `?limit=30&only_unread=false` | `{ chats: ChatSummary[] }` |

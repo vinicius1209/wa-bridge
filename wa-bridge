@@ -64,6 +64,9 @@ fail()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
 is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
 
 mkdir -p "$HOME_DIR/logs"
+# A pasta guarda credencial, banco e conversas: só o dono lê. Sem isto ela nascia com o
+# umask (755), já que o `mkdir` daqui roda antes de o daemon criá-la com 700.
+chmod 700 "$HOME_DIR"
 
 # Node >= 24 (o daemon usa `node:sqlite` nativo). Resolve sem depender do PATH, para
 # funcionar também em launchd/systemd e em clientes MCP de interface gráfica.
@@ -444,6 +447,9 @@ cmd_doctor() {
     local perms; perms="$(file_mode "$HOME_DIR/token")"
     [[ "$perms" == "600" ]] && ok "token com permissão 600" || warn "token com permissão $perms (esperado 600)"
   fi
+  local home_perms; home_perms="$(file_mode "$HOME_DIR")"
+  [[ "$home_perms" == "700" ]] && ok "pasta de estado com permissão 700" \
+    || warn "pasta de estado com permissão $home_perms (esperado 700)"
   cmd_status
 }
 
