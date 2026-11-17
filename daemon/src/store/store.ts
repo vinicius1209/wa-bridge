@@ -436,6 +436,12 @@ export class Store {
     this.addColumnIfMissing('contacts', 'phone_jid', 'TEXT');
   }
 
+  /** Fecha o banco. Depois disto nenhum método do Store funciona. */
+  close(): void {
+    this.stmts.clear();
+    this.db.close();
+  }
+
   /**
    * Adiciona uma coluna a uma tabela já existente, se ainda não estiver lá.
    * O SQLite não tem `ADD COLUMN IF NOT EXISTS`, e bancos criados antes desta
@@ -460,7 +466,10 @@ export class Store {
          sender_name = excluded.sender_name, from_me = excluded.from_me, ts = excluded.ts,
          type = excluded.type, text = excluded.text, caption = excluded.caption,
          view_once = excluded.view_once, quoted_text = excluded.quoted_text,
-         has_media = excluded.has_media, media_state = excluded.media_state,
+         has_media = excluded.has_media,
+         -- Reentrega da mesma mensagem não pode "desprocessar" uma mídia já materializada.
+         media_state = CASE WHEN messages.media_state IN ('ready', 'failed', 'expired')
+                            THEN messages.media_state ELSE excluded.media_state END,
          raw_json = excluded.raw_json`,
     ).run(
       m.id,
@@ -478,6 +487,36 @@ export class Store {
       m.mediaState,
       rawJson,
     );
+  }
+
+  /**
+   * Insere a mensagem só se o id ainda não existir; devolve `true` se inseriu.
+   * Para entradas que podem repetir o que já está no banco (ex.: a fila offline): nada de
+   * sobrescrever, e quem chama só mexe em contadores quando a mensagem é nova.
+   */
+  insertMessageIfNew(m: StoredMessage, rawJson: string): boolean {
+    const result = this.prepare(
+      `INSERT INTO messages (id, chat_jid, sender_jid, sender_name, from_me, ts, type,
+         text, caption, view_once, quoted_text, has_media, media_state, raw_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO NOTHING`,
+    ).run(
+      m.id,
+      m.chatJid,
+      m.senderJid,
+      m.senderName,
+      m.fromMe ? 1 : 0,
+      m.ts,
+      m.type,
+      m.text,
+      m.caption,
+      m.viewOnce ? 1 : 0,
+      m.quotedText,
+      m.hasMedia ? 1 : 0,
+      m.mediaState,
+      rawJson,
+    );
+    return Number(result.changes) > 0;
   }
 
   /**
@@ -715,7 +754,12 @@ export class Store {
 
   // --------------------------------------------------------------- contatos
 
-  /** Insere ou atualiza um contato, preservando alias já definido quando não informado. */
+  /**
+   * Insere ou atualiza um contato, preservando alias já definido quando não informado.
+   * As datas de contato só avançam: uma mensagem antiga que chega depois de uma nova
+   * não pode recuar `last_*_at` (o `MAX` escalar do SQLite devolve NULL se um dos lados
+   * for NULL, daí o COALESCE em volta).
+   */
   upsertContact(c: ContactRecord): void {
     this.prepare(
       `INSERT INTO contacts (jid, push_name, alias, phone_jid, last_inbound_at, last_outbound_at)
@@ -724,8 +768,10 @@ export class Store {
          push_name = COALESCE(excluded.push_name, contacts.push_name),
          alias = COALESCE(excluded.alias, contacts.alias),
          phone_jid = COALESCE(excluded.phone_jid, contacts.phone_jid),
-         last_inbound_at = COALESCE(excluded.last_inbound_at, contacts.last_inbound_at),
-         last_outbound_at = COALESCE(excluded.last_outbound_at, contacts.last_outbound_at)`,
+         last_inbound_at = COALESCE(MAX(excluded.last_inbound_at, contacts.last_inbound_at),
+                                    excluded.last_inbound_at, contacts.last_inbound_at),
+         last_outbound_at = COALESCE(MAX(excluded.last_outbound_at, contacts.last_outbound_at),
+                                     excluded.last_outbound_at, contacts.last_outbound_at)`,
     ).run(c.jid, c.pushName, c.alias, c.phoneJid, c.lastInboundAt, c.lastOutboundAt);
   }
 
@@ -771,20 +817,27 @@ export class Store {
     const queryDigits = onlyDigits(query);
     const looksLikeNumber = query.includes('@') || queryDigits.length >= 8;
 
-    const matches: ContactMatch[] = [];
+    let matches: ContactMatch[] = [];
+    /** Contato LID que casou pelo número → telefone real dele (para desduplicar abaixo). */
+    const lidPhones = new Map<string, string>();
 
     for (const row of rows) {
       const contact = rowToContact(row);
-      const contactDigits = onlyDigits(contact.jid);
 
       if (looksLikeNumber) {
-        const jidMatches = query.includes('@') && normalizeText(contact.jid) === normalizeText(query);
+        // Contato LID guarda o telefone real em `phone_jid`: buscar pelo telefone tem que
+        // achá-lo, como `resolveGroupParticipant` já faz.
+        const jidMatches =
+          query.includes('@') &&
+          (normalizeText(contact.jid) === normalizedQuery ||
+            (contact.phoneJid !== null && normalizeText(contact.phoneJid) === normalizedQuery));
+        const candidateDigits = [onlyDigits(contact.jid), contact.phoneJid ? onlyDigits(contact.phoneJid) : ''];
         const numberMatches =
           queryDigits.length >= 8 &&
-          contactDigits.length >= 8 &&
-          (contactDigits.endsWith(queryDigits) || queryDigits.endsWith(contactDigits));
+          candidateDigits.some((d) => d.length >= 8 && (d.endsWith(queryDigits) || queryDigits.endsWith(d)));
         if (jidMatches || numberMatches) {
           matches.push(this.toContactMatch(contact, 0.95, 'number'));
+          if (contact.phoneJid && contact.phoneJid !== contact.jid) lidPhones.set(contact.jid, contact.phoneJid);
         }
         continue;
       }
@@ -834,6 +887,17 @@ export class Store {
           lastContactAt: this.lastContactAt(g.jid),
         });
       }
+    }
+
+    // A mesma pessoa costuma existir duas vezes: pelo telefone e pelo LID (com o telefone
+    // em `phone_jid`). Casar as duas pelo mesmo número não é ambiguidade, e devolvê-las
+    // faria o gate recusar com AMBIGUOUS_CONTACT: fica o JID de telefone.
+    if (lidPhones.size > 0) {
+      const matched = new Set(matches.map((m) => m.jid));
+      matches = matches.filter((m) => {
+        const phone = lidPhones.get(m.jid);
+        return !(phone && matched.has(phone));
+      });
     }
 
     return matches.sort((a, b) => b.score - a.score);

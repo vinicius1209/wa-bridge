@@ -28,8 +28,12 @@ export interface ResolvedMention {
   mentionJids: string[];
 }
 
-/** Captura tokens `@algumacoisa` escritos pelo agente, para trocar por `@<dígitos>`. */
-const NAME_TOKEN_RE = /@([\p{L}\p{N}_.-]+)/gu;
+/**
+ * Captura tokens `@algumacoisa` escritos pelo agente, para trocar por `@<dígitos>`.
+ * Ponto e hífen só valem no MEIO do nome (`@ana-maria`, `@jose.silva`): no fim são
+ * pontuação da frase, e `@Allan.` precisa capturar `Allan`.
+ */
+const NAME_TOKEN_RE = /@([\p{L}\p{N}_]+(?:[.-][\p{L}\p{N}_]+)*)/gu;
 
 /** Remove acentos e normaliza caixa (mesma regra do helper homônimo em `store.ts`). */
 function normalizeText(s: string): string {

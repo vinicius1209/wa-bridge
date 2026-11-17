@@ -11,6 +11,7 @@ import makeWASocket, {
   downloadMediaMessage,
   fetchLatestBaileysVersion,
   isJidGroup,
+  toNumber,
   useMultiFileAuthState,
   type AnyMessageContent,
   type GroupParticipant as BaileysGroupParticipant,
@@ -44,6 +45,31 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 
 /** Validade do cache local de membros de grupo (`groupMetadata` tem rate limit). */
 const GROUP_PARTICIPANTS_TTL_MS = 3_600_000;
+
+/**
+ * De onde veio a mensagem: `live` (chegou agora) ou `offline` (fila entregue na
+ * reconexão, o Baileys marca como `append`).
+ */
+type IngestSource = 'live' | 'offline';
+
+/**
+ * `JSON.parse` que devolve `Buffer` onde o `JSON.stringify` gravou `{ type: 'Buffer', data }`.
+ * O `raw_json` guarda chaves de mídia assim; para o Baileys reenviar uma mensagem, os
+ * campos binários precisam voltar a ser bytes de verdade.
+ */
+function parseRawWithBuffers(rawJson: string): unknown {
+  return JSON.parse(rawJson, (_key, value: unknown) => {
+    if (
+      value !== null &&
+      typeof value === 'object' &&
+      (value as { type?: unknown }).type === 'Buffer' &&
+      Array.isArray((value as { data?: unknown }).data)
+    ) {
+      return Buffer.from((value as { data: number[] }).data);
+    }
+    return value;
+  });
+}
 
 /** Remove o sufixo `:device` de um JID (ex.: `551199999999:12@s.whatsapp.net`). */
 function normalizeJid(jid: string): string {
@@ -216,6 +242,8 @@ export class WhatsAppConnection {
   private readonly store: Store;
   private readonly log: Logger;
   private readonly authDir: string;
+  /** Ligado por `close()`: a partir daí nenhuma reconexão é agendada. */
+  private closed = false;
 
   private socket: WASocket | null = null;
   private sessionState: SessionState = { state: 'connecting', me: null, qrDataUrl: null, since: Date.now(), lastError: null };
@@ -259,7 +287,10 @@ export class WhatsAppConnection {
       ),
       version,
       browser: Browsers.macOS('Chrome'),
-      getMessage: async () => undefined,
+      // O Baileys pede o conteúdo de uma mensagem já enviada quando o destinatário não
+      // conseguiu decifrá-la e pede reenvio (e para decifrar voto de enquete). Devolver
+      // `undefined` deixa a pessoa vendo "Aguardando mensagem" para sempre.
+      getMessage: async (key) => this.lookupMessageContent(key.id),
     });
     this.socket = socket;
 
@@ -299,11 +330,42 @@ export class WhatsAppConnection {
       if (socket !== this.socket) return;
       void this.handleConnectionUpdate(update);
     });
+    // `notify` é mensagem chegando agora; `append` é a fila que ficou no servidor enquanto
+    // o daemon estava fora, entregue na reconexão. Descartar `append` perdia tudo que
+    // chegou com o daemon parado.
     socket.ev.on('messages.upsert', ({ messages, type }) => {
       if (socket !== this.socket) return;
-      if (type !== 'notify') return;
-      for (const message of messages) this.handleIncomingMessage(message);
+      const source: IngestSource = type === 'notify' ? 'live' : 'offline';
+      for (const message of messages) this.handleIncomingMessage(message, source);
     });
+  }
+
+  /** Conteúdo de uma mensagem já vista (cache em memória ou `raw_json`), para o Baileys reenviar. */
+  private lookupMessageContent(id: string | null | undefined): WAMessageContent | undefined {
+    if (!id) return undefined;
+    const cached = this.rawMessages.get(id);
+    if (cached) return cached;
+    const rawJson = this.store.getRawJson(id);
+    if (!rawJson) return undefined;
+    try {
+      const parsed = parseRawWithBuffers(rawJson) as Partial<WAMessage>;
+      return parsed.message ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Encerra a conexão de vez, no desligamento do daemon: sem reconexão e SEM logout
+   * (`end`, não `logout`), então a credencial continua valendo no próximo boot.
+   */
+  close(): void {
+    this.closed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.retireSocket();
   }
 
   /** Desliga o socket atual sem que o `close` dele dispare reconexão (o handler o ignora). */
@@ -484,7 +546,7 @@ export class WhatsAppConnection {
 
   /** Agenda reconexão com backoff exponencial (teto 30s) e jitter. */
   private scheduleReconnect(): void {
-    if (this.reconnectTimer) return;
+    if (this.closed || this.reconnectTimer) return;
     this.reconnectAttempt += 1;
     const base = Math.min(RECONNECT_MAX_DELAY_MS, 1000 * 2 ** this.reconnectAttempt);
     const jitter = Math.floor(Math.random() * 1000);
@@ -499,21 +561,30 @@ export class WhatsAppConnection {
     }, delay);
   }
 
-  /** Converte e persiste uma mensagem recebida, e notifica os callbacks registrados. */
-  private handleIncomingMessage(raw: WAMessage): void {
+  /**
+   * Converte e persiste uma mensagem, e notifica os callbacks registrados. Devolve `true`
+   * se a mensagem foi gravada. A fila offline só grava o que ainda não existe (pode
+   * repetir mensagens já vistas) e só o que é novo mexe em contadores.
+   */
+  private handleIncomingMessage(raw: WAMessage, source: IngestSource = 'live'): boolean {
     const remoteJid = raw.key.remoteJid;
-    if (!remoteJid) return;
-    if (raw.message) this.rawMessages.set(raw.key.id ?? randomBytes(8).toString('hex'), raw.message);
+    if (!remoteJid) return false;
 
     const stored = this.parseMessage(raw, remoteJid);
-    if (!stored) return;
+    if (!stored) return false;
 
-    this.store.upsertMessage(stored, JSON.stringify(raw));
+    if (source === 'live') {
+      this.store.upsertMessage(stored, JSON.stringify(raw));
+    } else if (!this.store.insertMessageIfNew(stored, JSON.stringify(raw))) {
+      return false;
+    }
+    if (raw.message) this.rawMessages.set(stored.id, raw.message);
+
     // `senderPn` é o telefone real por trás de um LID (`@lid`). É o único jeito de o
     // preview do gate mostrar um número verdadeiro em vez de formatar o LID como telefone.
     this.updateChatAndContact(stored, extractSenderPn(raw));
 
-    this.log.debug({ chat: stored.chatJid, type: stored.type }, 'mensagem recebida');
+    this.log.debug({ chat: stored.chatJid, type: stored.type, source }, 'mensagem recebida');
 
     for (const cb of this.listeners) {
       try {
@@ -522,6 +593,7 @@ export class WhatsAppConnection {
         this.log.error({ error }, 'callback de onMessage lançou exceção');
       }
     }
+    return true;
   }
 
   /** Atualiza os registros de `chats` e `contacts` a partir de uma mensagem normalizada. */
@@ -568,10 +640,9 @@ export class WhatsAppConnection {
     const senderJid = fromMe
       ? null
       : normalizeJid(raw.key.participant ?? remoteJid);
-    const tsSeconds =
-      typeof raw.messageTimestamp === 'number'
-        ? raw.messageTimestamp
-        : Number(raw.messageTimestamp ?? 0);
+    // O timestamp pode vir como `Long`; `Number(long)` daria NaN e a mensagem
+    // ficaria com a hora em que foi gravada.
+    const tsSeconds = toNumber(raw.messageTimestamp);
     const type = getMessageType(raw.message);
     const hasMedia = type === 'image' || type === 'video' || type === 'audio' || type === 'document' || type === 'sticker';
     const quoted = raw.message.extendedTextMessage?.contextInfo?.quotedMessage;

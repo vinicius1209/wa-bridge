@@ -158,6 +158,26 @@ export function loadConfig(): Config {
 }
 
 /**
+ * Restringe a pasta de estado (e `auth/`) ao dono, com chmod 700.
+ *
+ * `mkdirSync(..., { mode })` só vale para pasta NOVA: quando o script `./wa-bridge` cria
+ * a pasta antes (para os logs), ela nasce com o umask (755) e o banco, a mídia e as
+ * conversas ficam legíveis por outros usuários da máquina. Devolve os avisos em vez de
+ * lançar: num bind-mount de Docker o chmod pode ser recusado, e isso não pode derrubar o boot.
+ */
+export function restrictStateDirs(config: Pick<Config, 'home' | 'authDir'>): string[] {
+  const warnings: string[] = [];
+  for (const dir of [config.home, config.authDir]) {
+    try {
+      chmodSync(dir, 0o700);
+    } catch (error) {
+      warnings.push(`não foi possível aplicar chmod 700 em ${dir}: ${(error as Error).message}`);
+    }
+  }
+  return warnings;
+}
+
+/**
  * Mascara um JID deixando só os 4 últimos dígitos visíveis.
  *
  * REGRA DE SEGURANÇA: só formata como telefone o que de fato é telefone

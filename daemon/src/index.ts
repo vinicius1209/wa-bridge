@@ -1,7 +1,7 @@
 /**
  * Bootstrap do wa-daemon: costura os módulos e define a ordem de inicialização.
  */
-import { loadConfig } from './config.js';
+import { loadConfig, restrictStateDirs } from './config.js';
 import { createApi } from './api/server.js';
 import { MediaProcessor } from './media/processor.js';
 import { Audit } from './obs/audit.js';
@@ -11,11 +11,15 @@ import { SendGate } from './send/gate.js';
 import { Store } from './store/store.js';
 import { WhatsAppConnection } from './whatsapp/connection.js';
 
+/** Teto para o desligamento limpo; passou disso, sai mesmo assim (launchd/systemd matam depois). */
+const SHUTDOWN_TIMEOUT_MS = 8_000;
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger({ level: config.logLevel, file: config.logFile });
 
   log.info({ home: config.home, port: config.port }, 'iniciando wa-daemon');
+  for (const warning of restrictStateDirs(config)) log.warn(warning);
 
   // 1. Persistência primeiro: todo o resto depende do store.
   const store = new Store(config.dbPath);
@@ -53,15 +57,30 @@ async function main(): Promise<void> {
     'wa-daemon pronto',
   );
 
+  let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     log.info({ signal }, 'encerrando wa-daemon');
+    setTimeout(() => {
+      log.warn('desligamento passou do tempo; saindo assim mesmo');
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS).unref();
+
     try {
       await api.close();
     } catch (error) {
       log.error({ error }, 'falha ao fechar a API');
     }
+    // Fecha o socket do WhatsApp sem logout: a credencial continua valendo no próximo boot.
+    wa.close();
     // `process.exit` não dispara `beforeExit`: sem isto as últimas chamadas somem das métricas.
     metrics.flush();
+    try {
+      store.close();
+    } catch (error) {
+      log.error({ error }, 'falha ao fechar o banco');
+    }
     process.exit(0);
   };
 
