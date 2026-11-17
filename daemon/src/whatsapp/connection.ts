@@ -23,8 +23,9 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import type { GroupParticipant, Logger, MessageType, NewChatQuota, SessionState, StoredMessage } from '../types.js';
-import type { Store } from '../store/store.js';
-import { isDeviceSyncProtocolType, isMediaCopyAssociation } from './protocol.js';
+import { removeMediaFiles } from '../store/retention.js';
+import type { MessageChange, MessageChangeResult, Store } from '../store/store.js';
+import { isDeviceSyncProtocolType, isMediaCopyAssociation, messageChangeKind } from './protocol.js';
 
 /** Métricas mínimas exigidas pela assinatura do contrato (ver `obs/metrics.ts`). */
 export interface Metrics {
@@ -280,6 +281,49 @@ class LruCache<V> {
       if (oldestKey !== undefined) this.map.delete(oldestKey);
     }
   }
+
+  delete(key: string): void {
+    this.map.delete(key);
+  }
+}
+
+/** Edição ou exclusão extraída de uma mensagem, com o conteúdo novo quando é edição. */
+interface ParsedChange {
+  change: MessageChange;
+  /** Conteúdo editado, para criar a mensagem quando a original não está no banco. */
+  edited: WAMessageContent | null;
+}
+
+/**
+ * Lê um `protocolMessage` de edição ou de "apagar para todos". Devolve `null` para
+ * qualquer outra mensagem. Quem fez a mudança sai da `key` de fora, como em `parseMessage`;
+ * o alvo é `protocolMessage.key.id`.
+ */
+function toMessageChange(raw: WAMessage, remoteJid: string): ParsedChange | null {
+  if (!raw.message) return null;
+  // Clientes novos mandam a edição embrulhada em `editedMessage` (FutureProofMessage).
+  const content = (raw.message.editedMessage?.message as WAMessageContent | null | undefined) ?? unwrapMessage(raw.message);
+  const protocol = content.protocolMessage;
+  const kind = messageChangeKind(protocol?.type);
+  const targetId = protocol?.key?.id;
+  if (!protocol || !kind || !targetId) return null;
+
+  const fromMe = raw.key.fromMe ?? false;
+  const edited = kind === 'edit' ? ((protocol.editedMessage as WAMessageContent | null | undefined) ?? null) : null;
+  const at = protocol.timestampMs ? Number(toNumber(protocol.timestampMs)) : Number(toNumber(raw.messageTimestamp)) * 1000;
+  return {
+    change: {
+      kind,
+      chatJid: normalizeJid(remoteJid),
+      targetId,
+      fromMe,
+      senderJid: fromMe ? null : normalizeJid(raw.key.participant ?? remoteJid),
+      at: at || Date.now(),
+      text: extractTextContent(edited),
+      caption: extractCaption(edited),
+    },
+    edited,
+  };
 }
 
 export interface WhatsAppConnectionDeps {
@@ -298,6 +342,8 @@ export class WhatsAppConnection {
   private readonly store: Store;
   private readonly log: Logger;
   private readonly authDir: string;
+  /** Pasta das mídias baixadas (a mesma de `config.mediaDir`), para apagar a de uma mensagem apagada. */
+  private readonly mediaDir: string;
   private readonly historyDays: number;
   private readonly deviceName: string;
   /** Ligado por `close()`: a partir daí nenhuma reconexão é agendada. */
@@ -317,6 +363,7 @@ export class WhatsAppConnection {
     this.store = deps.store;
     this.log = deps.log;
     this.authDir = join(deps.home, 'auth');
+    this.mediaDir = join(deps.home, 'media');
     this.historyDays = deps.historyDays;
     this.deviceName = deps.deviceName;
   }
@@ -735,6 +782,13 @@ export class WhatsAppConnection {
     const remoteJid = raw.key.remoteJid;
     if (!remoteJid) return false;
 
+    // Edição e "apagar para todos" mudam a original, em qualquer origem; não viram mensagem.
+    const parsed = toMessageChange(raw, remoteJid);
+    if (parsed) {
+      this.applyIncomingChange(raw, remoteJid, parsed);
+      return false;
+    }
+
     const stored = this.parseMessage(raw, remoteJid);
     if (!stored) return false;
 
@@ -762,6 +816,64 @@ export class WhatsAppConnection {
       }
     }
     return true;
+  }
+
+  /**
+   * Aplica uma edição ou exclusão que chegou (de outra pessoa ou dos aparelhos do usuário).
+   *
+   * Edição de uma mensagem de texto que não está no banco vira a própria mensagem, já com
+   * o texto editado: o histórico do pareamento traz só a versão editada, e esse é o único
+   * jeito de não perder o conteúdo. Exclusão de mensagem que não está no banco é ignorada:
+   * não há o que apagar, e quem apagou pode nem ser o autor (admin de grupo).
+   */
+  private applyIncomingChange(raw: WAMessage, remoteJid: string, parsed: ParsedChange): void {
+    const { change, edited } = parsed;
+    let result = this.applyChange(change);
+    if (result.outcome === 'missing' && change.kind === 'edit' && edited && getMessageType(edited) === 'text') {
+      const original = { ...raw, key: { ...raw.key, id: change.targetId }, message: edited } as WAMessage;
+      const stored = this.parseMessage(original, remoteJid);
+      if (stored && this.store.insertMessageIfNew(stored, JSON.stringify(original))) {
+        this.updateChatAndContact(stored, extractSenderPn(raw), false);
+        result = this.applyChange(change);
+      }
+    }
+    this.log.debug({ chat: change.chatJid, kind: change.kind, outcome: result.outcome }, 'edição ou exclusão recebida');
+  }
+
+  /** Aplica a mudança no banco e tira do cache e do disco a mídia de uma mensagem apagada. */
+  private applyChange(change: MessageChange): MessageChangeResult {
+    const result = this.store.applyMessageChange(change);
+    if (change.kind === 'revoke' && result.outcome === 'applied') {
+      this.rawMessages.delete(change.targetId);
+      if (result.mediaFiles) {
+        removeMediaFiles(result.mediaFiles, this.mediaDir).catch((error: unknown) => {
+          this.log.warn({ error, id: change.targetId }, 'falha ao apagar a mídia de uma mensagem apagada');
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Reaplica as edições e exclusões que versões anteriores gravaram como mensagem `unknown`
+   * e tira essas linhas do banco. Roda na subida do daemon; sem nada pendente, é uma
+   * consulta só. Devolve quantas linhas saíram.
+   */
+  reapplyStoredChanges(): number {
+    let removed = 0;
+    for (const row of this.store.listStoredMessageChanges()) {
+      try {
+        const raw = parseRawWithBuffers(row.rawJson) as WAMessage;
+        const remoteJid = raw.key?.remoteJid;
+        const parsed = remoteJid ? toMessageChange(raw, remoteJid) : null;
+        if (parsed && remoteJid) this.applyIncomingChange(raw, remoteJid, parsed);
+      } catch (error) {
+        this.log.warn({ error, id: row.id }, 'falha ao reaplicar edição ou exclusão gravada');
+      }
+      this.store.dropMessage(row.id);
+      removed += 1;
+    }
+    return removed;
   }
 
   /**
@@ -1078,6 +1190,34 @@ export class WhatsAppConnection {
     const message = this.store.getMessage(messageId);
     const key = this.keyFor(chatJid, messageId, message?.fromMe ?? false);
     await socket.sendMessage(chatJid, { react: { text: emoji, key } });
+  }
+
+  /**
+   * Edita o texto de uma mensagem enviada pelo usuário e grava a edição no banco. Quem
+   * valida autoria, tipo e prazo é o gate; aqui só sai o `protocolMessage`.
+   */
+  async editMessage(chatJid: string, messageId: string, text: string): Promise<void> {
+    const socket = this.requireSocket();
+    const key = this.keyFor(chatJid, messageId, true);
+    const result = await socket.sendMessage(chatJid, { text, edit: key });
+    // O destinatário pode pedir reenvio da própria edição; sem o conteúdo em cache ele
+    // ficaria vendo "Aguardando mensagem".
+    if (result?.key.id && result.message) this.rawMessages.set(result.key.id, result.message);
+    this.applyChange(this.ownChange('edit', chatJid, messageId, text));
+  }
+
+  /** Apaga para todos uma mensagem enviada pelo usuário e aplica a exclusão no banco. */
+  async deleteMessage(chatJid: string, messageId: string): Promise<void> {
+    const socket = this.requireSocket();
+    const key = this.keyFor(chatJid, messageId, true);
+    const result = await socket.sendMessage(chatJid, { delete: key });
+    if (result?.key.id && result.message) this.rawMessages.set(result.key.id, result.message);
+    this.applyChange(this.ownChange('revoke', chatJid, messageId, null));
+  }
+
+  /** `MessageChange` de uma edição ou exclusão feita pelo próprio daemon. */
+  private ownChange(kind: 'edit' | 'revoke', chatJid: string, targetId: string, text: string | null): MessageChange {
+    return { kind, chatJid, targetId, fromMe: true, senderJid: null, at: Date.now(), text, caption: null };
   }
 
   /** Devolve o conteúdo bruto (Baileys) de uma mensagem em cache, para o processador de mídia. */

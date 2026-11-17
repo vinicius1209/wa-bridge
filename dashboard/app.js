@@ -481,6 +481,8 @@
       it.appendChild(top);
       (d.bubbles || []).forEach(function (b) { it.appendChild(el('div', 'bubble', b)); });
       var chips = el('div', 'chips');
+      if (d.action === 'edit') chips.appendChild(el('span', 'chip', 'edita mensagem enviada'));
+      if (d.action === 'delete') chips.appendChild(el('span', 'chip warn', 'apaga para todos'));
       if (d.mediaPath) {
         var mc = el('span', 'chip');
         mc.appendChild(icon('i-file'));
@@ -914,6 +916,8 @@
     'send.cancelled': ['i-x', 'err', 'envio cancelado'],
     'send.failed': ['i-x', 'err', 'envio falhou'],
     'send.blocked': ['i-ban', 'block', 'envio bloqueado'],
+    'message.edited': ['i-draft', 'info', 'mensagem editada'],
+    'message.deleted': ['i-x', 'info', 'mensagem apagada para todos'],
     'media.materialized': ['i-media', 'info', 'mídia processada'],
     'session.paired': ['i-link', 'ok', 'sessão pareada'],
     'session.lost': ['i-unlink', 'err', 'sessão perdida'],

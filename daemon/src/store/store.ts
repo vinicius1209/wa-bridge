@@ -56,6 +56,32 @@ export interface SendRecord {
   firstContact: boolean;
 }
 
+/** Edição ou "apagar para todos" de uma mensagem, já extraída do `protocolMessage`. */
+export interface MessageChange {
+  kind: 'edit' | 'revoke';
+  /** Conversa onde a mudança chegou: tem que ser a mesma da mensagem alvo. */
+  chatJid: string;
+  targetId: string;
+  /** Quem mudou: o próprio usuário (`fromMe`) ou o remetente em `senderJid`. */
+  fromMe: boolean;
+  senderJid: string | null;
+  at: number;
+  /** Só na edição: o texto novo (com o prefixo de mídia, como em `messages.text`) e a legenda. */
+  text: string | null;
+  caption: string | null;
+}
+
+/** O que aconteceu com uma `MessageChange`. */
+export interface MessageChangeResult {
+  /**
+   * `applied`: a mensagem mudou. `missing`: a original não está no banco. `ignored`: a
+   * original existe, mas a mudança não vale (outra conversa, outro autor, já apagada).
+   */
+  outcome: 'applied' | 'missing' | 'ignored';
+  /** Arquivos da mídia de uma mensagem apagada, para quem chamou tirar do disco. */
+  mediaFiles: MediaFiles | null;
+}
+
 /** Linha bruta de `messages`, antes da conversão de inteiros para boolean. */
 interface MessageRow {
   id: string;
@@ -72,6 +98,8 @@ interface MessageRow {
   has_media: number;
   media_state: string;
   raw_json: string | null;
+  edited_at?: number | null;
+  deleted_at?: number | null;
 }
 
 interface ChatRow {
@@ -219,6 +247,8 @@ function rowToMessage(row: MessageRow): StoredMessage {
     quotedText: row.quoted_text,
     hasMedia: row.has_media === 1,
     mediaState: row.media_state as MediaState,
+    editedAt: row.edited_at ?? null,
+    deletedAt: row.deleted_at ?? null,
   };
 }
 
@@ -421,6 +451,7 @@ export class Store {
       () => this.migrateDropDeviceSyncMessages(),
       () => this.migrateSendFirstContact(),
       () => this.migrateDropRedundantMessages(),
+      () => this.migrateMessageChanges(),
     ];
     const row = this.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number };
     for (let target = Number(row.user_version) + 1; target <= steps.length; target += 1) {
@@ -614,6 +645,17 @@ export class Store {
       .run(...copies);
   }
 
+  /**
+   * Passo 6: `messages.edited_at` e `messages.deleted_at` (idempotente), para edição e
+   * "apagar para todos". As que versões anteriores gravaram como `unknown` são reaplicadas
+   * na subida do daemon (`WhatsAppConnection.reapplyStoredChanges`), que sabe ler o
+   * conteúdo da mensagem.
+   */
+  private migrateMessageChanges(): void {
+    this.addColumnIfMissing('messages', 'edited_at', 'INTEGER');
+    this.addColumnIfMissing('messages', 'deleted_at', 'INTEGER');
+  }
+
   /** Fecha o banco. Depois disto nenhum método do Store funciona. */
   close(): void {
     this.stmts.clear();
@@ -633,7 +675,10 @@ export class Store {
 
   // ------------------------------------------------------------- mensagens
 
-  /** Insere ou substitui uma mensagem, guardando o JSON bruto do Baileys. */
+  /**
+   * Insere ou substitui uma mensagem, guardando o JSON bruto do Baileys. A reentrega da
+   * original não desfaz uma edição (o texto editado fica) nem traz de volta uma apagada.
+   */
   upsertMessage(m: StoredMessage, rawJson: string): void {
     this.prepare(
       `INSERT INTO messages (id, chat_jid, sender_jid, sender_name, from_me, ts, type,
@@ -642,13 +687,16 @@ export class Store {
        ON CONFLICT(id) DO UPDATE SET
          chat_jid = excluded.chat_jid, sender_jid = excluded.sender_jid,
          sender_name = excluded.sender_name, from_me = excluded.from_me, ts = excluded.ts,
-         type = excluded.type, text = excluded.text, caption = excluded.caption,
+         type = excluded.type,
+         text = CASE WHEN messages.edited_at IS NULL THEN excluded.text ELSE messages.text END,
+         caption = CASE WHEN messages.edited_at IS NULL THEN excluded.caption ELSE messages.caption END,
          view_once = excluded.view_once, quoted_text = excluded.quoted_text,
          has_media = excluded.has_media,
          -- Reentrega da mesma mensagem não pode "desprocessar" uma mídia já materializada.
          media_state = CASE WHEN messages.media_state IN ('ready', 'failed', 'expired')
                             THEN messages.media_state ELSE excluded.media_state END,
-         raw_json = excluded.raw_json`,
+         raw_json = excluded.raw_json
+       WHERE messages.deleted_at IS NULL`,
     ).run(
       m.id,
       m.chatJid,
@@ -719,6 +767,7 @@ export class Store {
        SELECT h.source AS hit_source, h.snippet AS hit_snippet,
               m.id, m.chat_jid, m.sender_jid, m.sender_name, m.from_me, m.ts, m.type,
               m.text, m.caption, m.view_once, m.quoted_text, m.has_media, m.media_state,
+              m.edited_at, m.deleted_at,
               NULL AS raw_json, COALESCE(c.name, ct.push_name) AS chat_name
          FROM hits h
          JOIN messages m ON m.id = h.message_id
@@ -765,6 +814,115 @@ export class Store {
       | MessageRow
       | undefined;
     return row ? rowToMessage(row) : null;
+  }
+
+  /**
+   * Aplica uma edição ou um "apagar para todos" na mensagem original.
+   *
+   * Só vale na mesma conversa e vinda de quem escreveu a original (o Baileys avisa que esses
+   * tipos podem vir de qualquer um, então quem confere é a gente). A exceção é apagar em
+   * grupo: admin pode apagar mensagem dos outros. Apagada perde texto, legenda, citação,
+   * mídia e o conteúdo do `raw_json` (fica só a `key`), como no celular; os arquivos da
+   * mídia voltam em `mediaFiles` para quem chamou remover do disco.
+   */
+  applyMessageChange(c: MessageChange): MessageChangeResult {
+    const row = this.prepare(
+      'SELECT chat_jid, sender_jid, from_me, has_media, deleted_at FROM messages WHERE id = ?',
+    ).get(c.targetId) as unknown as
+      | { chat_jid: string; sender_jid: string | null; from_me: number; has_media: number; deleted_at: number | null }
+      | undefined;
+    if (!row) return { outcome: 'missing', mediaFiles: null };
+    if (row.chat_jid !== c.chatJid || row.deleted_at !== null) return { outcome: 'ignored', mediaFiles: null };
+    if (!this.canChangeMessage(row, c)) return { outcome: 'ignored', mediaFiles: null };
+
+    if (c.kind === 'edit') {
+      if (c.text === null) return { outcome: 'ignored', mediaFiles: null };
+      this.prepare(
+        `UPDATE messages SET text = ?, caption = CASE WHEN has_media = 1 THEN ? ELSE caption END,
+                edited_at = ?
+          WHERE id = ?`,
+      ).run(c.text, c.caption, c.at, c.targetId);
+      return { outcome: 'applied', mediaFiles: null };
+    }
+
+    const media = this.prepare('SELECT path, frames_json FROM media WHERE message_id = ?').get(c.targetId) as unknown as
+      | { path: string | null; frames_json: string | null }
+      | undefined;
+    this.prepare('DELETE FROM media WHERE message_id = ?').run(c.targetId);
+    this.prepare(
+      `UPDATE messages SET text = NULL, caption = NULL, quoted_text = NULL, has_media = 0,
+              media_state = 'none', deleted_at = ?,
+              raw_json = CASE WHEN json_valid(raw_json) AND json_type(raw_json, '$.key') = 'object'
+                              THEN json_object('key', json(json_extract(raw_json, '$.key'))) END
+        WHERE id = ?`,
+    ).run(c.at, c.targetId);
+    const mediaFiles = media?.path
+      ? { messageId: c.targetId, path: media.path, framePaths: parseFramePaths(media.frames_json) }
+      : null;
+    return { outcome: 'applied', mediaFiles };
+  }
+
+  /** Quem fez a mudança pode mudar esta mensagem? (ver `applyMessageChange`) */
+  private canChangeMessage(
+    row: { chat_jid: string; sender_jid: string | null; from_me: number },
+    c: MessageChange,
+  ): boolean {
+    const sameAuthor =
+      row.from_me === 1
+        ? c.fromMe
+        : !c.fromMe && c.senderJid !== null && row.sender_jid !== null && this.samePerson(row.sender_jid, c.senderJid);
+    if (sameAuthor) return true;
+    if (c.kind !== 'revoke' || !row.chat_jid.endsWith('@g.us')) return false;
+    // O usuário apagando a mensagem de outra pessoa num grupo onde é admin: vem dos
+    // aparelhos dele, e o WhatsApp já recusaria se ele não fosse.
+    if (c.fromMe) return true;
+    if (c.senderJid === null) return false;
+    const admin = this.prepare(
+      `SELECT 1 FROM group_participants
+        WHERE group_jid = ? AND is_admin = 1 AND (jid = ? OR (phone_jid IS NOT NULL AND phone_jid = ?))`,
+    ).get(row.chat_jid, c.senderJid, this.phoneFor(c.senderJid));
+    return admin !== undefined;
+  }
+
+  /** Dois JIDs são a mesma pessoa? Mesmo JID, ou LID e telefone ligados em `contacts`. */
+  private samePerson(a: string, b: string): boolean {
+    return a === b || this.phoneFor(a) === this.phoneFor(b);
+  }
+
+  /**
+   * Edições e exclusões que versões anteriores gravaram como mensagem `unknown`, da mais
+   * antiga para a mais nova, para a conexão reaplicar (`reapplyStoredChanges`).
+   */
+  listStoredMessageChanges(): Array<{ id: string; rawJson: string }> {
+    const rows = this.prepare(
+      `SELECT id, raw_json FROM messages
+        WHERE type = 'unknown'
+          AND CASE WHEN json_valid(raw_json)
+                   THEN json_extract(raw_json, '$.message.protocolMessage.type') END
+              IN ('REVOKE', 'MESSAGE_EDIT', 0, 14)
+        ORDER BY ts`,
+    ).all() as unknown as Array<{ id: string; raw_json: string }>;
+    return rows.map((r) => ({ id: r.id, rawJson: r.raw_json }));
+  }
+
+  /**
+   * Apaga uma linha de `messages` (ex.: uma edição gravada como `unknown`) e acerta a
+   * conversa: sai da lista se ficou vazia, senão a última atividade volta a ser a das outras.
+   */
+  dropMessage(id: string): void {
+    const row = this.prepare('SELECT chat_jid FROM messages WHERE id = ?').get(id) as unknown as
+      | { chat_jid: string }
+      | undefined;
+    if (!row) return;
+    this.prepare('DELETE FROM messages WHERE id = ?').run(id);
+    this.prepare('DELETE FROM chats WHERE jid = ? AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_jid = ?)').run(
+      row.chat_jid,
+      row.chat_jid,
+    );
+    this.prepare('UPDATE chats SET last_message_at = (SELECT MAX(ts) FROM messages WHERE chat_jid = ?) WHERE jid = ?').run(
+      row.chat_jid,
+      row.chat_jid,
+    );
   }
 
   // ------------------------------------------------------------------ chats

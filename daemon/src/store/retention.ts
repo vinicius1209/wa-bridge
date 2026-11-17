@@ -33,7 +33,7 @@ function isInside(target: string, root: string): boolean {
 }
 
 /** Remove do disco o arquivo de uma mídia, os keyframes e o `.transcript.txt` dela. */
-async function removeMediaFiles(files: MediaFiles, mediaDir: string): Promise<void> {
+export async function removeMediaFiles(files: MediaFiles, mediaDir: string): Promise<void> {
   if (files.path.length === 0) return;
   const dir = dirname(files.path);
   const targets = [

@@ -55,3 +55,20 @@ export function isMediaCopyAssociation(type: unknown): boolean {
   if (typeof type === 'number') return COPY_IDS.has(type);
   return typeof type === 'string' && COPY_NAMES.has(type);
 }
+
+/**
+ * Tipos de `protocolMessage` que mudam uma mensagem que já está na conversa: "apagar para
+ * todos" (`REVOKE`) e edição (`MESSAGE_EDIT`). Não viram mensagem própria: são aplicados na
+ * original. Números do enum `proto.Message.ProtocolMessage.Type` (um teste confere).
+ */
+export const MESSAGE_CHANGE_PROTOCOL_TYPES = {
+  REVOKE: 0,
+  MESSAGE_EDIT: 14,
+} as const;
+
+/** `revoke` para "apagar para todos", `edit` para edição, `null` para qualquer outro tipo. */
+export function messageChangeKind(type: unknown): 'revoke' | 'edit' | null {
+  if (type === MESSAGE_CHANGE_PROTOCOL_TYPES.REVOKE || type === 'REVOKE') return 'revoke';
+  if (type === MESSAGE_CHANGE_PROTOCOL_TYPES.MESSAGE_EDIT || type === 'MESSAGE_EDIT') return 'edit';
+  return null;
+}

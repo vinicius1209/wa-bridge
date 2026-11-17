@@ -155,6 +155,9 @@ export interface StoredMessage {
   quotedText: string | null;
   hasMedia: boolean;
   mediaState: 'none' | 'pending' | 'ready' | 'failed' | 'expired';
+  editedAt?: number | null;    // última edição (epoch ms); `text` já é o editado
+  deletedAt?: number | null;   // apagada para todos: sem texto, legenda nem mídia
+                               // (os dois vêm em toda leitura do banco)
   senderPhoneJid?: string | null;  // telefone real quando senderJid é `@lid` e conhecido
                                    // (só HTTP `GET /messages`; MCP remove — ver abaixo)
 }
@@ -184,6 +187,9 @@ export interface MediaArtifact {
 
 export interface SendDraft {
   confirmToken: string;
+  action: 'send' | 'edit' | 'delete';
+  targetPreview: { messageId: string; ts: number; text: string | null } | null;
+                               // edição/exclusão: a mensagem como está hoje
   chatJid: string;
   resolvedName: string | null;
   maskedNumber: string;        // "+55 51 ****-4821"
@@ -251,6 +257,9 @@ export class WhatsAppConnection {
   setPresence(chatJid: string, p: 'composing' | 'paused'): Promise<void>;  // nunca available
   markRead(chatJid: string): Promise<void>;
   react(chatJid: string, messageId: string, emoji: string): Promise<void>;
+  editMessage(chatJid: string, messageId: string, text: string): Promise<void>;
+  deleteMessage(chatJid: string, messageId: string): Promise<void>;   // apagar para todos
+  reapplyStoredChanges(): number;          // na subida: edições/exclusões gravadas como unknown
   getRawMessage(messageId: string): WAMessageContent | null;     // para o processador de mídia
   unwrapRawMessage(m: WAMessageContent): WAMessageContent;       // view-once
   isViewOnceMessage(m: WAMessageContent | null | undefined): boolean;
@@ -260,10 +269,23 @@ export class WhatsAppConnection {
 Entrada de mensagens, por origem. Em qualquer origem, `protocolMessage` de sincronização
 entre os aparelhos da conta (histórico, chaves, configurações; lista em
 `whatsapp/protocol.ts`) não vira mensagem: o celular manda isso na conversa do usuário com
-ele mesmo. Edição e "apagar para todos" não estão na lista. Também não viram mensagem o
+ele mesmo. Também não viram mensagem o
 cabeçalho de álbum (`albumMessage`, só avisa quantas fotos vêm; cada foto chega como
 mensagem normal) e as cópias de mídia que chegam em `associatedChildMessage` (versão HD de
 foto ou vídeo e a parte em vídeo de foto com movimento): a original já está no banco.
+
+Edição (`MESSAGE_EDIT`) e "apagar para todos" (`REVOKE`) também não viram mensagem, em
+qualquer origem: são aplicadas na original com `Store.applyMessageChange`. Só valem na
+mesma conversa e vindas de quem escreveu a original (o Baileys avisa que esses tipos podem
+vir de qualquer um); a exceção é apagar em grupo, que admin pode fazer com a mensagem dos
+outros (conferido em `group_participants`). A edição troca `text`/`caption` e grava
+`edited_at`. A exclusão grava `deleted_at` e tira texto, legenda, citação, a linha de
+`media` (e os arquivos do disco) e o conteúdo do `raw_json`, que fica só com a `key`, como
+no celular. Edição de uma mensagem de texto que não está no banco vira a própria mensagem,
+já editada: o histórico do pareamento traz só a versão editada. Exclusão de mensagem que
+não está no banco é ignorada. A reentrega da original (`upsertMessage`) não desfaz a
+edição nem traz de volta a apagada. Na subida, `reapplyStoredChanges` faz o mesmo com as
+edições e exclusões que versões anteriores gravaram como `unknown` e apaga essas linhas.
 
 
 - **ao vivo** (`messages.upsert` com `notify`): `upsertMessage`, soma em não lidas,
@@ -315,6 +337,9 @@ export class Store {
   listChats(opts: { limit: number; onlyUnread: boolean }): ChatSummary[];
   listMessages(opts: { chatJid: string; limit: number; since?: number }): StoredMessage[];
   getMessage(id: string): StoredMessage | null;
+  applyMessageChange(c: MessageChange): MessageChangeResult;   // edição/exclusão na original
+  listStoredMessageChanges(): Array<{ id: string; rawJson: string }>;   // unknown legadas
+  dropMessage(id: string): void;                   // e acerta a conversa
   upsertChat(c: ChatSummary): void;
   upsertContact(c: ContactRecord): void;
   resolveContact(query: string): ContactMatch[];   // alias > nome exato > nome parcial > número
@@ -389,6 +414,10 @@ export class SendGate {
                       metrics: Metrics; audit: Audit; config: Config });
   draft(input: DraftInput): Promise<SendDraft>;
   confirm(confirmToken: string, agent: string): Promise<{ sendId: string; etaMs: number }>;
+  draftEdit(input: { messageId: string; text: string }): Promise<SendDraft>;
+  draftDelete(input: { messageId: string }): Promise<SendDraft>;
+  confirmChange(confirmToken: string, action: 'edit' | 'delete',
+                agent: string): Promise<{ action; messageId; chatJid }>;
   cancel(sendId: string): Promise<{ cancelled: boolean; stage: string }>;
   isBlocked(jid: string): { blocked: boolean; reason?: string };
 }
@@ -431,6 +460,16 @@ Invariantes do gate — **quebrar qualquer um destes é falha de segurança**:
    barra. Nome ambíguo entre membros → `MENTION_AMBIGUOUS` com candidatos, nunca
    escolha. `mentionsPreview` é obrigatório no preview: menção notifica a pessoa, e
    o humano tem que ver quem antes de aprovar.
+9. Edição e "apagar para todos" (`draftEdit`/`draftDelete` + `confirmChange`) passam pelo
+   mesmo rascunho com token de uso único, blocklist no rascunho e no confirm, e 1 rascunho
+   ativo por conversa. Só mensagem do usuário (`NOT_OWN_MESSAGE`), não apagada; edição só
+   de texto (`EDIT_NOT_SUPPORTED`) e até 15 minutos depois do envio; exclusão até 2 dias.
+   O prazo é conferido de novo no confirm. O preview traz `targetPreview` (a mensagem
+   como está hoje). O token guarda a ação (`payload.action`): `confirm` recusa token de
+   edição/exclusão e `confirmChange` recusa token de outra ação, com
+   `WRONG_DRAFT_ACTION` e sem queimar o token. Sem isso, o texto de uma edição sairia
+   como mensagem nova. Os limites de volume não valem aqui: a mudança corrige ou desfaz
+   algo que já saiu, não inicia conversa, e executa na hora, sem delay humano.
 
 ### `daemon/src/send/mentions.ts`
 
@@ -582,7 +621,8 @@ CREATE TABLE IF NOT EXISTS messages (
   from_me INTEGER NOT NULL, ts INTEGER NOT NULL, type TEXT NOT NULL,
   text TEXT, caption TEXT, view_once INTEGER NOT NULL DEFAULT 0, quoted_text TEXT,
   has_media INTEGER NOT NULL DEFAULT 0, media_state TEXT NOT NULL DEFAULT 'none',
-  raw_json TEXT);
+  raw_json TEXT,
+  edited_at INTEGER, deleted_at INTEGER);    -- migração 6
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts DESC);
 
 CREATE TABLE IF NOT EXISTS media (
@@ -637,6 +677,7 @@ passo já publicado.
 | 3 | apaga as `unknown` que são `protocolMessage` de sincronização entre aparelhos, gravadas antes do filtro de entrada |
 | 4 | coluna `sends.first_contact` (idempotente), que o limite de conversas novas por dia conta |
 | 5 | apaga as `unknown` que são cabeçalho de álbum ou cópia de mídia (HD, foto com movimento), gravadas antes do filtro de entrada |
+| 6 | colunas `messages.edited_at` e `messages.deleted_at` (idempotente). As edições e exclusões gravadas como `unknown` são reaplicadas na subida por `reapplyStoredChanges`, que sabe ler o conteúdo |
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
@@ -688,6 +729,10 @@ janela anterior, para a variação) e `byAgent[].lastCallAt`.
 | POST | `/send/draft` | `DraftInput` | `SendDraft` |
 | POST | `/send/confirm` | `{ confirmToken, urgent?, acknowledge? }` | `{ sendId, etaMs }` |
 | POST | `/send/cancel` | `{ sendId }` | `{ cancelled, stage }` |
+| POST | `/send/edit/draft` | `{ messageId, text }` | `SendDraft` com `action: 'edit'` (nada muda ainda) |
+| POST | `/send/edit/confirm` | `{ confirmToken }` | `{ action: 'edit', messageId, chatJid }` |
+| POST | `/send/delete/draft` | `{ messageId }` | `SendDraft` com `action: 'delete'` (nada muda ainda) |
+| POST | `/send/delete/confirm` | `{ confirmToken }` | `{ action: 'delete', messageId, chatJid }` |
 | POST | `/chats/:jid/read` | — | `{ ok: true }` |
 | POST | `/messages/:id/react` | `{ emoji }` | `{ ok: true }` |
 | GET | `/metrics/summary` | `?window=86400000` | `MetricsSummary` |
@@ -701,7 +746,8 @@ janela anterior, para a variação) e `byAgent[].lastCallAt`.
 
 ### Painel e o token de confirmação
 
-O painel lista os rascunhos pendentes (`GET /gate`) e pode **descartar**, mas nunca
+O painel lista os rascunhos pendentes (`GET /gate`, cada um com `action`: envio, edição
+ou exclusão) e pode **descartar**, mas nunca
 **confirmar**: cada rascunho sai com um `id` que é o hash (sha256, 16 hex) do token de
 confirmação, e o token em si nunca aparece em `/gate`. Descartar pelo `id` passa pelo
 mesmo `discardDraft` do agente (com auditoria). Aprovar continua sendo só no agente, depois
@@ -767,6 +813,8 @@ Se `to` for ambíguo (>1 match com score próximo), `/send/draft` responde **409
 | `wa_media` | POST `/media/:id` |
 | `wa_send_text` | POST `/send/draft` ou `/send/confirm` (ver abaixo) |
 | `wa_send_media` | idem, com `mediaPath` |
+| `wa_edit_message` | POST `/send/edit/draft` ou `/send/edit/confirm` |
+| `wa_delete_message` | POST `/send/delete/draft` ou `/send/delete/confirm` |
 | `wa_cancel` | POST `/send/cancel` (com `send_id`) ou `/send/discard` (com `confirm_token`) |
 | `wa_mark_read` | POST `/chats/:jid/read` |
 | `wa_react` | POST `/messages/:id/react` |
@@ -779,6 +827,10 @@ inequívoca, e deve instruir o modelo a **mostrar o preview ao humano antes de
 confirmar**. `wa_media` e `wa_read_messages` devolvem caminhos de arquivo locais;
 a tool description deve dizer ao modelo para ler a imagem com sua própria
 capacidade de visão.
+
+`wa_edit_message` e `wa_delete_message` seguem o mesmo padrão de dois modos: sem
+`confirm_token` criam o rascunho (com `targetPreview`, a mensagem que vai mudar), com
+`confirm_token` executam. A description também manda mostrar o rascunho ao humano antes.
 
 ## Regra de segurança que vale para todo o projeto
 

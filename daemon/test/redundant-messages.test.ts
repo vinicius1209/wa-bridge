@@ -118,7 +118,7 @@ test('migração 5 apaga cabeçalhos e cópias já gravados e preserva o resto',
   const migrated = new Store(path);
   try {
     migrated.migrate();
-    assert.equal(migrated.schemaVersion(), 5);
+    assert.equal(migrated.schemaVersion(), 6);
     for (const id of ['album', 'hd', 'movimento', 'hevc-numero']) assert.equal(migrated.getMessage(id), null, id);
     for (const id of ['figurinha', 'quebrado', 'foto']) assert.notEqual(migrated.getMessage(id), null, id);
   } finally {

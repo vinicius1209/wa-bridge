@@ -429,6 +429,75 @@ server.registerTool(
   ),
 );
 
+// ------------------------------------------------------------ wa_edit_message
+
+server.registerTool(
+  'wa_edit_message',
+  {
+    description:
+      'Edita o texto de uma mensagem que VOCÊ (o dono do número) enviou, em DOIS PASSOS, ' +
+      'igual a `wa_send_text`. Só mensagem de texto, até 15 minutos depois do envio; quem ' +
+      'recebe vê "Editada". Passo 1: chame com `message_id` (o `id` vindo de ' +
+      'wa_read_messages, com `fromMe: true`) e `text` (o texto novo, inteiro). Isso NÃO muda ' +
+      'nada: devolve um rascunho com `targetPreview` (a mensagem como está hoje), o texto ' +
+      'novo em `bubbles` e um `confirm_token`. MOSTRE ao humano o texto atual e o novo e ' +
+      'espere aprovação explícita. Passo 2: só depois da aprovação, chame de novo só com ' +
+      '`confirm_token`, e aí sim edita. Nunca pule do passo 1 para o passo 2 sem o humano ' +
+      'ter visto o rascunho.',
+    inputSchema: {
+      message_id: z.string().min(1).optional().describe('Id da mensagem a editar. Obrigatório no passo 1.'),
+      text: z.string().min(1).optional().describe('Texto novo, completo. Obrigatório no passo 1.'),
+      confirm_token: z.string().min(1).optional().describe('Token do rascunho. Presente => passo 2 (edita de fato).'),
+    },
+  },
+  safeHandler('wa_edit_message', async (args: { message_id?: string; text?: string; confirm_token?: string }) => {
+    if (args.confirm_token) {
+      return requestDaemon({ method: 'POST', path: '/send/edit/confirm', body: { confirmToken: args.confirm_token } });
+    }
+    if (!args.message_id || !args.text) {
+      throw new WaBridgeClientError(
+        'Passo 1 de wa_edit_message exige `message_id` e `text` (sem confirm_token).',
+        'MISSING_FIELDS',
+      );
+    }
+    return requestDaemon({
+      method: 'POST',
+      path: '/send/edit/draft',
+      body: { messageId: args.message_id, text: args.text },
+    });
+  }),
+);
+
+// ---------------------------------------------------------- wa_delete_message
+
+server.registerTool(
+  'wa_delete_message',
+  {
+    description:
+      'Apaga PARA TODOS uma mensagem que VOCÊ (o dono do número) enviou, em DOIS PASSOS, ' +
+      'igual a `wa_send_text`. Até 2 dias depois do envio; quem recebe vê "Mensagem ' +
+      'apagada", e não há como desfazer. Passo 1: chame com `message_id` (o `id` vindo de ' +
+      'wa_read_messages, com `fromMe: true`). Isso NÃO apaga nada: devolve um rascunho com ' +
+      '`targetPreview` (a mensagem que vai sumir) e um `confirm_token`. MOSTRE ao humano ' +
+      'qual mensagem será apagada e espere aprovação explícita. Passo 2: só depois da ' +
+      'aprovação, chame de novo só com `confirm_token`, e aí sim apaga. Nunca pule do ' +
+      'passo 1 para o passo 2 sem o humano ter visto o rascunho.',
+    inputSchema: {
+      message_id: z.string().min(1).optional().describe('Id da mensagem a apagar. Obrigatório no passo 1.'),
+      confirm_token: z.string().min(1).optional().describe('Token do rascunho. Presente => passo 2 (apaga de fato).'),
+    },
+  },
+  safeHandler('wa_delete_message', async (args: { message_id?: string; confirm_token?: string }) => {
+    if (args.confirm_token) {
+      return requestDaemon({ method: 'POST', path: '/send/delete/confirm', body: { confirmToken: args.confirm_token } });
+    }
+    if (!args.message_id) {
+      throw new WaBridgeClientError('Passo 1 de wa_delete_message exige `message_id` (sem confirm_token).', 'MISSING_FIELDS');
+    }
+    return requestDaemon({ method: 'POST', path: '/send/delete/draft', body: { messageId: args.message_id } });
+  }),
+);
+
 // ------------------------------------------------------------------ wa_cancel
 
 server.registerTool(

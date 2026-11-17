@@ -38,6 +38,16 @@ export interface StoredMessage {
   hasMedia: boolean;
   mediaState: MediaState;
   /**
+   * Quando a mensagem foi editada pela última vez (epoch ms), ou `null`. `text` já é o
+   * texto editado. Preenchido nas leituras do banco; ausente nos objetos internos.
+   */
+  editedAt?: number | null;
+  /**
+   * Quando a mensagem foi apagada para todos (epoch ms), ou `null`. Apagada fica sem
+   * texto, legenda e mídia, como no celular. Preenchido nas leituras do banco.
+   */
+  deletedAt?: number | null;
+  /**
    * Telefone real (`@s.whatsapp.net`) por trás do remetente quando `senderJid` é um
    * LID (`@lid`) e o número é conhecido (veio de `key.senderPn`); `null` caso
    * contrário. Preenchido só por `GET /messages` (HTTP); as tools MCP o removem.
@@ -215,6 +225,26 @@ export interface MentionPreview {
 export type SendWarning = 'NEVER_CONTACTED' | 'QUIET_HOURS' | 'GROUP_CHAT' | 'LARGE_TEXT';
 
 /**
+ * O que um rascunho faz quando confirmado: enviar mensagem nova (`send`), editar
+ * (`edit`) ou apagar para todos (`delete`) uma mensagem já enviada pelo usuário.
+ */
+export type DraftAction = 'send' | 'edit' | 'delete';
+
+/** Mensagem que um rascunho de edição ou exclusão vai mudar, como está hoje. */
+export interface DraftTarget {
+  messageId: string;
+  ts: number;
+  text: string | null;
+}
+
+/** Resultado do confirm de uma edição ou exclusão: executada na hora, sem delay humano. */
+export interface MessageChangeDone {
+  action: 'edit' | 'delete';
+  messageId: string;
+  chatJid: string;
+}
+
+/**
  * Cota de conversas novas que o próprio WhatsApp informa à conta (`message-capping.update`
  * do Baileys 7). Só existe depois que o servidor manda; contas sem restrição podem nunca
  * receber. `status` é o `capping_status` dele (`NONE`, `FIRST_WARNING`, `SECOND_WARNING`,
@@ -231,6 +261,12 @@ export interface NewChatQuota {
 /** Rascunho devolvido ao agente, para o humano revisar antes de confirmar. */
 export interface SendDraft {
   confirmToken: string;
+  action: DraftAction;
+  /**
+   * Na edição e na exclusão, a mensagem que vai mudar, com o texto atual. O humano TEM
+   * que ver qual é antes de aprovar. `null` no envio.
+   */
+  targetPreview: DraftTarget | null;
   chatJid: string;
   resolvedName: string | null;
   maskedNumber: string;
@@ -291,6 +327,8 @@ export type AuditAction =
   | 'send.cancelled'
   | 'send.failed'
   | 'send.blocked'
+  | 'message.edited'
+  | 'message.deleted'
   | 'media.materialized'
   | 'session.paired'
   | 'session.lost'
@@ -346,6 +384,7 @@ export interface MetricsSummary {
 export interface PendingDraftView {
   /** Id opaco (hash do token), suficiente para descartar e inútil para confirmar. */
   id: string;
+  action: DraftAction;
   chatJid: string;
   name: string | null;
   maskedNumber: string;

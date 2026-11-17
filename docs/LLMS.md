@@ -13,7 +13,7 @@ interpretável (transcrição de áudio/vídeo, caminho de imagem/PDF para você
 visão) — e enviar mensagens, mas todo envio passa por um gate de confirmação humana em
 dois passos. Você nunca envia nada sem um humano ter visto o preview.
 
-## As 14 tools
+## As 16 tools
 
 | Tool | Para quê | Input | Saída | Quando NÃO usar |
 |---|---|---|---|---|
@@ -27,6 +27,8 @@ dois passos. Você nunca envia nada sem um humano ter visto o preview.
 | `wa_media` | materializar mídia de uma mensagem (download, transcrição, keyframes) | `message_id`, `transcribe?` (default true), `frames?` (default true) | `MediaArtifact` com `path`, `transcript`, `framePaths`, `error` | não chame em laço para todas as mensagens de um chat "por garantia" — só quando a tarefa pedir aquela mídia |
 | `wa_send_text` | enviar texto — **dois modos**, ver seção dedicada abaixo | sem `confirm_token`: `to`, `text`, `mentions?`, `quote_message_id?`; com `confirm_token`: `confirm_token`, `urgent?`, `acknowledge?` | sem token: `SendDraft` (preview); com token: `{ sendId, etaMs }` | nunca chame o modo com `confirm_token` sem o humano ter visto o preview primeiro |
 | `wa_send_media` | enviar mídia (imagem/doc/áudio) — mesmo protocolo de dois passos | idem `wa_send_text`, com `media_path` e `caption?` no lugar de `text` | idem `wa_send_text` | mesma regra: preview antes de confirmar |
+| `wa_edit_message` | editar o texto de uma mensagem que o humano enviou: **mesmo protocolo de dois passos**, ver seção abaixo | sem `confirm_token`: `message_id`, `text`; com `confirm_token`: só ele | sem token: `SendDraft` com `action: "edit"` e `targetPreview`; com token: `{ action, messageId, chatJid }` | mensagem de outra pessoa, de mídia, ou enviada há mais de 15 minutos: o daemon recusa |
+| `wa_delete_message` | apagar para todos uma mensagem que o humano enviou: **mesmo protocolo de dois passos** | sem `confirm_token`: `message_id`; com `confirm_token`: só ele | sem token: `SendDraft` com `action: "delete"` e `targetPreview`; com token: `{ action, messageId, chatJid }` | não tem volta; mensagem de outra pessoa ou enviada há mais de 2 dias: o daemon recusa |
 | `wa_cancel` | abortar um envio em andamento, ou descartar um rascunho não confirmado | `send_id` (envio em andamento) **ou** `confirm_token` (rascunho) | `{ cancelled, stage }` ou `{ discarded }` | depois de `done` não desfaz nada; use `confirm_token` quando o humano pedir para mudar o texto do rascunho |
 | `wa_mark_read` | marcar chat como lido | `jid` | `{ ok: true }` | não use para "espiar" sem necessidade — marcar como lido é uma ação visível para quem te mandou mensagem |
 | `wa_react` | reagir com emoji a uma mensagem | `message_id`, `emoji` | `{ ok: true }` | reação também é visível — não reaja a mensagens que você não foi pedido para reagir |
@@ -79,6 +81,42 @@ mesma tool em dois modos:
 O motivo de o gate existir é justamente esse: nenhuma alucinação sua e nenhuma injection
 vinda do conteúdo de uma mensagem consegue enviar nada sozinha, porque nenhuma das duas
 tem como produzir a aprovação humana que o passo 2 depende de ter acontecido antes.
+
+## Editar e apagar uma mensagem enviada
+
+`wa_edit_message` e `wa_delete_message` seguem o mesmo protocolo de dois passos do envio:
+o passo 1 só devolve um rascunho, e nada muda no WhatsApp até o passo 2 com o
+`confirm_token`, depois de o humano aprovar.
+
+1. Ache o `id` da mensagem com `wa_read_messages`. Só servem mensagens com `fromMe: true`
+   (enviadas pelo humano, por você ou pelo celular dele).
+2. Passo 1: `wa_edit_message({ message_id, text })` (o texto novo, inteiro) ou
+   `wa_delete_message({ message_id })`. O rascunho vem com `action` (`edit` ou `delete`) e
+   `targetPreview` (a mensagem como está hoje: `messageId`, `ts`, `text`). Na edição, o
+   texto novo vem em `bubbles`, numa bolha só.
+3. **Mostre ao humano qual mensagem vai mudar** (o `text` de `targetPreview`) e, na edição,
+   o texto novo. Espere a aprovação explícita. Apagar para todos não tem volta.
+4. Passo 2: chame a MESMA tool só com o `confirm_token`. A mudança sai na hora, sem
+   "digitando", e a resposta é `{ action, messageId, chatJid }`.
+
+Regras que o daemon aplica:
+
+- Edição só de mensagem de texto, até **15 minutos** depois do envio. Quem recebe vê
+  "Editada".
+- Apagar para todos até **2 dias** depois do envio. Quem recebe vê "Mensagem apagada".
+- O prazo é conferido de novo no passo 2: se vencer enquanto o humano lê, vem
+  `EDIT_WINDOW_EXPIRED` ou `DELETE_WINDOW_EXPIRED`.
+- O token de edição ou exclusão só vale na tool dele. Em `wa_send_text` ele é recusado
+  com `WRONG_DRAFT_ACTION`, sem queimar o token.
+- Vale o máximo de 1 rascunho ativo por conversa, somando envio, edição e exclusão. Os
+  limites de volume (`RATE_LIMITED`) não se aplicam: a mudança corrige algo que já saiu.
+- `wa_cancel({ confirm_token })` descarta o rascunho, como no envio.
+
+**Na leitura**, `wa_read_messages` e `wa_search` trazem `editedAt` (quando a mensagem foi
+editada; `text` já é o texto novo) e `deletedAt` (quando foi apagada para todos; vem sem
+`text`, legenda nem mídia, como no celular). Isso vale também para edições e exclusões
+feitas por outras pessoas. Mensagem apagada não tem o conteúdo original: não tente
+recuperá-lo.
 
 ## @Marcar alguém num grupo (menções)
 
@@ -152,6 +190,12 @@ Vêm no array `warnings` do `SendDraft`. Nenhum deles bloqueia o draft; eles mud
 | `CONFIRMATION_REQUIRED` | 428 | você chamou `confirm` sem satisfazer um warning (`acknowledge`/`urgent` faltando). Releia o draft e corrija. |
 | `UNAUTHORIZED` | 401 | token do daemon ausente/errado, ou o próprio daemon fora do ar. Problema de infraestrutura, não seu — avise o humano. |
 | `MEDIA_NOT_FOUND` | 404 | o `media_path` de `wa_send_media` não existe ou não é legível. Confira o caminho absoluto. |
+| `NOT_OWN_MESSAGE` | 403 | `wa_edit_message`/`wa_delete_message` numa mensagem de outra pessoa. Só dá para mudar mensagem com `fromMe: true`. |
+| `MESSAGE_DELETED` | 409 | a mensagem já foi apagada. Não há o que editar nem apagar. |
+| `EDIT_NOT_SUPPORTED` | 409 | só mensagem de texto pode ser editada por aqui (não legenda de mídia). Avise o humano. |
+| `EDIT_WINDOW_EXPIRED` | 409 | passou de 15 minutos desde o envio; o WhatsApp não deixa mais editar. Ofereça mandar uma correção como mensagem nova. |
+| `DELETE_WINDOW_EXPIRED` | 409 | passou de 2 dias desde o envio. Avise o humano; não tente por outro caminho. |
+| `WRONG_DRAFT_ACTION` | 409 | o token é de outra ação (ex.: token de edição em `wa_send_text`). Confirme pela tool que criou o rascunho (`detail.action`); o token continua valendo. |
 
 **Erros de mídia não são HTTP**: `wa_media` responde normalmente e o problema vem no campo
 `error` do `MediaArtifact`.
@@ -259,6 +303,11 @@ Grupos têm `maskedNumber: "grupo"`, nunca um número — grupo não tem telefon
   `mentionsPreview`** → só depois de aprovação, `wa_send_text({ confirm_token })`. Se
   vier `MENTION_AMBIGUOUS` ou `MENTION_NOT_IN_GROUP`, use `wa_group_participants({ group: jid })`
   e pergunte ao humano qual é — nunca escolha.
+- **"Corrige a mensagem que acabei de mandar pro João"** → `wa_resolve_contact({ q: "João" })`
+  → `wa_read_messages({ chat: jid, limit: 10 })` → ache a última com `fromMe: true` →
+  `wa_edit_message({ message_id, text: "<texto corrigido inteiro>" })` → mostre ao humano
+  o `targetPreview.text` e o texto novo → só depois de aprovação,
+  `wa_edit_message({ confirm_token })`. Para apagar, o mesmo caminho com `wa_delete_message`.
 - **"O que tem nessa imagem que o João mandou"** → `wa_resolve_contact({ q: "João" })` → `wa_read_messages({ chat: jid })` → ache a mensagem `type: "image"` → `wa_media({ message_id })` → leia `path` com visão.
 
 ## Limites honestos

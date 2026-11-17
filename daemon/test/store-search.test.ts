@@ -126,11 +126,11 @@ test('banco antigo (sem versão) migra e passa a buscar o que já existia', () =
   const migrated = new Store(legacyPath);
   try {
     migrated.migrate();
-    assert.equal(migrated.schemaVersion(), 5);
+    assert.equal(migrated.schemaVersion(), 6);
     assert.equal(migrated.searchMessages({ query: 'antes busca', limit: 10 })[0]?.message.id, 'velha');
     // Rodar de novo não repete passo nenhum.
     migrated.migrate();
-    assert.equal(migrated.schemaVersion(), 5);
+    assert.equal(migrated.schemaVersion(), 6);
   } finally {
     migrated.close();
   }

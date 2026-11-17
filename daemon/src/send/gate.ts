@@ -11,14 +11,17 @@ import type { Metrics } from '../obs/metrics.js';
 import type { DraftRecord, Store } from '../store/store.js';
 import type {
   ActiveSendView,
+  DraftAction,
   DraftInput,
   GateSnapshot,
   Logger,
   MentionPreview,
+  MessageChangeDone,
   PendingDraftView,
   SendDraft,
   SendWarning,
   NewChatQuota,
+  StoredMessage,
 } from '../types.js';
 import type { WhatsAppConnection } from '../whatsapp/connection.js';
 import { isBlocked as isBlockedJid } from './blocklist.js';
@@ -35,6 +38,10 @@ const LARGE_TEXT_THRESHOLD = 1200;
 const AMBIGUITY_SCORE_GAP = 0.15;
 const ONE_HOUR_MS = 3_600_000;
 const ONE_DAY_MS = 86_400_000;
+/** Até quando o WhatsApp aceita editar uma mensagem enviada. */
+const EDIT_WINDOW_MS = 15 * 60_000;
+/** Até quando apagamos para todos. O WhatsApp aceita um pouco mais; ficamos abaixo. */
+const DELETE_WINDOW_MS = 2 * ONE_DAY_MS;
 /** Quanto da cota de conversas novas do WhatsApp fica de reserva (mínimo 1). */
 const NEW_CHAT_QUOTA_RESERVE = 0.1;
 
@@ -70,6 +77,10 @@ export interface CallCtx {
  * (o processo pode, em teoria, reconstruir o envio só a partir do token).
  */
 interface DraftPayload {
+  /** Ausente em rascunho de versão anterior do daemon, que só sabia enviar (`send`). */
+  action?: DraftAction;
+  /** Mensagem que a edição ou a exclusão vai mudar; ausente no envio. */
+  targetMessageId?: string | null;
   chatJid: string;
   text: string | null;
   mediaPath: string | null;
@@ -421,6 +432,8 @@ export class SendGate {
 
     return {
       confirmToken,
+      action: 'send',
+      targetPreview: null,
       chatJid: jid,
       resolvedName: resolved.name,
       maskedNumber: maskNumber(this.store.phoneFor(jid)),
@@ -453,43 +466,11 @@ export class SendGate {
     // um confirm sem o `acknowledge`/`urgent` exigido queimaria o rascunho: o agente
     // recebe CONFIRMATION_REQUIRED, repete com o campo certo e ganha "token já consumed",
     // obrigando a refazer o rascunho e a mostrar tudo de novo ao humano.
-    const existing = this.store.getDraft(confirmToken);
-    if (!existing) {
-      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação não encontrado');
-    }
-    if (existing.status !== 'pending') {
-      throw new AppError('DRAFT_NOT_FOUND', 404, `token de confirmação já ${existing.status}`);
-    }
-    if (existing.expiresAt <= now) {
-      this.audit.record({
-        ts: now,
-        traceId,
-        agent,
-        action: 'draft.expired',
-        chatJid: existing.chatJid,
-        outcome: 'denied',
-        detail: { confirmToken },
-      });
-      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação expirado');
-    }
-
-    const payload = JSON.parse(existing.payloadJson) as DraftPayload;
+    const payload = this.pendingPayload(confirmToken, agent, traceId, now);
+    // Token de edição ou exclusão não envia: o texto da edição sairia como mensagem nova.
+    this.assertDraftAction(payload, 'send');
     const jid = payload.chatJid;
-
-    // Revalida blocklist: o arquivo pode ter sido editado entre o draft e o confirm.
-    const block = this.isBlocked(jid);
-    if (block.blocked) {
-      this.audit.record({
-        ts: now,
-        traceId,
-        agent,
-        action: 'send.blocked',
-        chatJid: jid,
-        outcome: 'denied',
-        detail: { reason: block.reason, stage: 'confirm' },
-      });
-      throw new AppError('BLOCKED', 403, `destino bloqueado (${block.reason})`);
-    }
+    this.assertNotBlocked(jid, agent, traceId, now);
 
     const missing: string[] = [];
     if (payload.warnings.includes('NEVER_CONTACTED') && !(opts.acknowledge ?? []).includes('NEVER_CONTACTED')) {
@@ -562,6 +543,269 @@ export class SendGate {
     void this.runSend(sendId, jid, payload, agent, traceId);
 
     return { sendId, etaMs: payload.estimatedDelayMs };
+  }
+
+  /** Rascunho de edição de uma mensagem de texto enviada pelo usuário (até 15 minutos depois). */
+  async draftEdit(input: { messageId: string; text: string }, ctx: CallCtx = {}): Promise<SendDraft> {
+    if (!input.text || input.text.trim().length === 0) {
+      throw new AppError('VALIDATION', 400, '"text" é obrigatório');
+    }
+    return this.draftChange('edit', input.messageId, input.text, ctx);
+  }
+
+  /** Rascunho de "apagar para todos" de uma mensagem enviada pelo usuário (até 2 dias depois). */
+  async draftDelete(input: { messageId: string }, ctx: CallCtx = {}): Promise<SendDraft> {
+    return this.draftChange('delete', input.messageId, null, ctx);
+  }
+
+  /**
+   * Monta o rascunho de uma edição ou exclusão. Passa pelas mesmas travas do envio (token
+   * opaco de uso único, blocklist, um rascunho ativo por conversa), e o preview traz a
+   * mensagem como está hoje (`targetPreview`) para o humano conferir o alvo.
+   */
+  private async draftChange(
+    action: 'edit' | 'delete',
+    messageId: string,
+    text: string | null,
+    ctx: CallCtx,
+  ): Promise<SendDraft> {
+    const agent = ctx.agent ?? 'unknown';
+    const traceId = ctx.traceId ?? randomUUID();
+    const now = Date.now();
+
+    const target = this.assertChangeable(action, messageId, now);
+    if (action === 'edit' && text === target.text) {
+      throw new AppError('VALIDATION', 400, 'o texto novo é igual ao atual');
+    }
+    const jid = target.chatJid;
+
+    const block = this.isBlocked(jid);
+    if (block.blocked) {
+      this.audit.record({
+        ts: now,
+        traceId,
+        agent,
+        action: 'send.blocked',
+        chatJid: jid,
+        outcome: 'denied',
+        detail: { reason: block.reason, stage: 'draft' },
+      });
+      throw new AppError('BLOCKED', 403, `destino bloqueado (${block.reason})`);
+    }
+
+    this.store.expireDrafts(now);
+    const pending = this.store.activeDraftForChat(jid);
+    if (pending) {
+      throw new AppError('DRAFT_ALREADY_PENDING', 409, 'já existe um rascunho pendente para este chat', {
+        confirmToken: pending.confirmToken,
+      });
+    }
+
+    const warnings: SendWarning[] = [];
+    if (jid.endsWith('@g.us')) warnings.push('GROUP_CHAT');
+    if ((text?.length ?? 0) > LARGE_TEXT_THRESHOLD) warnings.push('LARGE_TEXT');
+
+    // A edição troca o texto inteiro de uma mensagem só: não quebra em bubbles.
+    const bubbles = text !== null ? [text] : [];
+    const confirmToken = randomBytes(24).toString('base64url');
+    const expiresAt = now + this.config.draftTtlMs;
+    const payload: DraftPayload = {
+      action,
+      targetMessageId: messageId,
+      chatJid: jid,
+      text,
+      mediaPath: null,
+      caption: null,
+      quoteMessageId: null,
+      bubbles,
+      mentions: [],
+      warnings,
+      estimatedDelayMs: 0,
+    };
+
+    this.store.insertDraft({
+      confirmToken,
+      chatJid: jid,
+      payloadJson: JSON.stringify(payload),
+      agent,
+      traceId,
+      createdAt: now,
+      expiresAt,
+      status: 'pending',
+    });
+
+    this.audit.record({
+      ts: now,
+      traceId,
+      agent,
+      action: 'draft.created',
+      chatJid: jid,
+      outcome: 'ok',
+      detail: { confirmToken, action, messageId, warnings },
+    });
+
+    return {
+      confirmToken,
+      action,
+      targetPreview: { messageId, ts: target.ts, text: target.text },
+      chatJid: jid,
+      resolvedName: this.store.getChatName(jid),
+      maskedNumber: maskNumber(this.store.phoneFor(jid)),
+      lastContactAt: this.store.lastContactAt(jid),
+      neverContacted: false,
+      bubbles,
+      mediaPath: null,
+      quotedPreview: null,
+      mentionsPreview: [],
+      estimatedDelayMs: 0,
+      warnings,
+      expiresAt,
+    };
+  }
+
+  /**
+   * Confere se a mensagem pode ser editada ou apagada agora: existe, é do usuário, não foi
+   * apagada, é de texto (na edição) e está dentro do prazo do WhatsApp. Roda no rascunho e
+   * de novo no confirm, porque o prazo pode vencer enquanto o humano lê o preview.
+   */
+  private assertChangeable(action: 'edit' | 'delete', messageId: string, now: number): StoredMessage {
+    const target = this.store.getMessage(messageId);
+    if (!target) {
+      throw new AppError('NOT_FOUND', 404, `mensagem "${messageId}" não encontrada`);
+    }
+    if (!target.fromMe) {
+      throw new AppError('NOT_OWN_MESSAGE', 403, 'só dá para editar ou apagar mensagem enviada por você');
+    }
+    if (target.deletedAt) {
+      throw new AppError('MESSAGE_DELETED', 409, 'esta mensagem já foi apagada');
+    }
+    if (action === 'edit') {
+      if (target.type !== 'text') {
+        throw new AppError('EDIT_NOT_SUPPORTED', 409, 'só mensagem de texto pode ser editada');
+      }
+      if (now - target.ts > EDIT_WINDOW_MS) {
+        throw new AppError('EDIT_WINDOW_EXPIRED', 409, 'o WhatsApp só deixa editar até 15 minutos depois do envio');
+      }
+    } else if (now - target.ts > DELETE_WINDOW_MS) {
+      throw new AppError('DELETE_WINDOW_EXPIRED', 409, 'só apagamos para todos até 2 dias depois do envio');
+    }
+    return target;
+  }
+
+  /**
+   * Confirma um rascunho de edição ou exclusão e executa na hora, sem delay humano (não é
+   * mensagem nova). Mesmas garantias do `confirm`: token de uso único, consumido só depois
+   * de todas as validações, e blocklist conferida de novo. Os limites de volume não valem
+   * aqui: a mudança corrige ou desfaz algo que já saiu e não inicia conversa, e travar uma
+   * correção por limite seria pior do que deixá-la passar.
+   */
+  async confirmChange(
+    confirmToken: string,
+    action: 'edit' | 'delete',
+    agent: string,
+    opts: { traceId?: string } = {},
+  ): Promise<MessageChangeDone> {
+    const traceId = opts.traceId ?? randomUUID();
+    const now = Date.now();
+
+    const payload = this.pendingPayload(confirmToken, agent, traceId, now);
+    this.assertDraftAction(payload, action);
+    const messageId = payload.targetMessageId;
+    if (!messageId || (action === 'edit' && !payload.text)) {
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'rascunho incompleto; refaça o rascunho');
+    }
+    const jid = payload.chatJid;
+    this.assertNotBlocked(jid, agent, traceId, now);
+    this.assertChangeable(action, messageId, now);
+
+    if (!this.store.consumeDraft(confirmToken, now)) {
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação já usado por outra chamada');
+    }
+
+    const auditAction = action === 'edit' ? 'message.edited' : 'message.deleted';
+    try {
+      if (action === 'edit') await this.wa.editMessage(jid, messageId, payload.text ?? '');
+      else await this.wa.deleteMessage(jid, messageId);
+    } catch (error) {
+      this.log.error({ error, messageId, traceId }, `falha ao executar ${action === 'edit' ? 'edição' : 'exclusão'}`);
+      this.audit.record({
+        ts: Date.now(),
+        traceId,
+        agent,
+        action: auditAction,
+        chatJid: jid,
+        outcome: 'error',
+        detail: { messageId, error: error instanceof Error ? error.message : String(error) },
+      });
+      throw error;
+    }
+
+    this.audit.record({
+      ts: Date.now(),
+      traceId,
+      agent,
+      action: auditAction,
+      chatJid: jid,
+      outcome: 'ok',
+      detail: { messageId },
+    });
+    return { action, messageId, chatJid: jid };
+  }
+
+  /**
+   * Payload de um rascunho ainda pendente e dentro da validade, sem consumir o token.
+   * `DRAFT_NOT_FOUND` para token inexistente, já usado, descartado ou vencido.
+   */
+  private pendingPayload(confirmToken: string, agent: string, traceId: string, now: number): DraftPayload {
+    const existing = this.store.getDraft(confirmToken);
+    if (!existing) {
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação não encontrado');
+    }
+    if (existing.status !== 'pending') {
+      throw new AppError('DRAFT_NOT_FOUND', 404, `token de confirmação já ${existing.status}`);
+    }
+    if (existing.expiresAt <= now) {
+      this.audit.record({
+        ts: now,
+        traceId,
+        agent,
+        action: 'draft.expired',
+        chatJid: existing.chatJid,
+        outcome: 'denied',
+        detail: { confirmToken },
+      });
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação expirado');
+    }
+    return JSON.parse(existing.payloadJson) as DraftPayload;
+  }
+
+  /** Recusa um rascunho confirmado pelo caminho de outra ação (ex.: edição em `/send/confirm`). */
+  private assertDraftAction(payload: DraftPayload, expected: DraftAction): void {
+    const action = payload.action ?? 'send';
+    if (action === expected) return;
+    const names: Record<DraftAction, string> = { send: 'envio', edit: 'edição', delete: 'exclusão' };
+    throw new AppError(
+      'WRONG_DRAFT_ACTION',
+      409,
+      `este rascunho é de ${names[action]}, não de ${names[expected]}; confirme pela tool de ${names[action]}`,
+      { action },
+    );
+  }
+
+  /** Revalida a blocklist no confirm: o arquivo pode ter mudado desde o rascunho. */
+  private assertNotBlocked(jid: string, agent: string, traceId: string, now: number): void {
+    const block = this.isBlocked(jid);
+    if (!block.blocked) return;
+    this.audit.record({
+      ts: now,
+      traceId,
+      agent,
+      action: 'send.blocked',
+      chatJid: jid,
+      outcome: 'denied',
+      detail: { reason: block.reason, stage: 'confirm' },
+    });
+    throw new AppError('BLOCKED', 403, `destino bloqueado (${block.reason})`);
   }
 
   /** Executa o envio (mídia primeiro, depois bubbles de texto) e atualiza `stage` conforme avança. */
@@ -730,6 +974,7 @@ export class SendGate {
       const payload = JSON.parse(d.payloadJson) as DraftPayload;
       return {
         id: draftIdFor(d.confirmToken),
+        action: payload.action ?? 'send',
         chatJid: d.chatJid,
         name: this.store.getChatName(d.chatJid),
         maskedNumber: maskNumber(this.store.phoneFor(d.chatJid)),

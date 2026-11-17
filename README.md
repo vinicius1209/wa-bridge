@@ -38,10 +38,11 @@ o WhatsApp com `device_removed`, então os agentes não podem abrir conexões pr
 
 O que vem junto:
 
-- **14 tools MCP**: listar conversas, ler mensagens, buscar em todas as conversas
+- **16 tools MCP**: listar conversas, ler mensagens, buscar em todas as conversas
   (texto e transcrições), baixar e transcrever mídia, resolver contatos e grupos por nome,
-  enviar texto e mídia, citar mensagens, @marcar pessoas em grupo, reagir, marcar como
-  lido, cancelar envio.
+  enviar texto e mídia, citar mensagens, @marcar pessoas em grupo, editar e apagar para
+  todos uma mensagem sua, reagir, marcar como lido, cancelar envio. Edição e exclusão que
+  chegam de outras pessoas mudam a mensagem original no banco.
 - **Histórico de 7 dias** importado no pareamento, e as mensagens que chegam com o daemon
   parado entram quando ele volta.
 - **Stream de mensagens novas** (`GET /events`, Server-Sent Events) para notificação,

@@ -45,6 +45,8 @@ async function main(): Promise<void> {
     historyDays: config.historyDays,
     deviceName: config.deviceName,
   });
+  const reapplied = wa.reapplyStoredChanges();
+  if (reapplied > 0) log.info({ reapplied }, 'edições e exclusões gravadas como mensagem foram reaplicadas');
 
   // O `Metrics` não recebe a conexão no construtor (dependência circular), então o estado
   // da sessão chega por provider. Sem este wiring o dashboard mostra a sessão sempre fechada.

@@ -389,6 +389,35 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
     });
   });
 
+  /** POST /send/edit/draft: rascunho de edição de uma mensagem do usuário; nada muda ainda. */
+  app.post('/send/edit/draft', async (req) => {
+    const body = asRecord(req.body, 'body');
+    const messageId = requireString(body, 'messageId');
+    const text = requireString(body, 'text');
+    return gate.draftEdit({ messageId, text }, { agent: req.callAgent, traceId: req.traceId });
+  });
+
+  /** POST /send/edit/confirm: consome o token e edita a mensagem na hora. */
+  app.post('/send/edit/confirm', async (req) => {
+    const body = asRecord(req.body, 'body');
+    const confirmToken = requireString(body, 'confirmToken');
+    return gate.confirmChange(confirmToken, 'edit', req.callAgent, { traceId: req.traceId });
+  });
+
+  /** POST /send/delete/draft: rascunho de "apagar para todos"; nada muda ainda. */
+  app.post('/send/delete/draft', async (req) => {
+    const body = asRecord(req.body, 'body');
+    const messageId = requireString(body, 'messageId');
+    return gate.draftDelete({ messageId }, { agent: req.callAgent, traceId: req.traceId });
+  });
+
+  /** POST /send/delete/confirm: consome o token e apaga a mensagem para todos na hora. */
+  app.post('/send/delete/confirm', async (req) => {
+    const body = asRecord(req.body, 'body');
+    const confirmToken = requireString(body, 'confirmToken');
+    return gate.confirmChange(confirmToken, 'delete', req.callAgent, { traceId: req.traceId });
+  });
+
   /** POST /send/discard — descarta um rascunho ainda não confirmado, liberando o chat. */
   app.post('/send/discard', async (req) => {
     const body = asRecord(req.body, 'body');
