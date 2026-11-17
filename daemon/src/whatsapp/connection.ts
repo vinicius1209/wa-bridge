@@ -14,6 +14,7 @@ import makeWASocket, {
   toNumber,
   useMultiFileAuthState,
   type AnyMessageContent,
+  type Chat,
   type GroupParticipant as BaileysGroupParticipant,
   type WAMessage,
   type WAMessageContent,
@@ -21,8 +22,9 @@ import makeWASocket, {
   type WASocket,
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
-import type { GroupParticipant, Logger, MessageType, SessionState, StoredMessage } from '../types.js';
+import type { GroupParticipant, Logger, MessageType, NewChatQuota, SessionState, StoredMessage } from '../types.js';
 import type { Store } from '../store/store.js';
+import { isDeviceSyncProtocolType, isMediaCopyAssociation } from './protocol.js';
 
 /** Métricas mínimas exigidas pela assinatura do contrato (ver `obs/metrics.ts`). */
 export interface Metrics {
@@ -46,11 +48,40 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 /** Validade do cache local de membros de grupo (`groupMetadata` tem rate limit). */
 const GROUP_PARTICIPANTS_TTL_MS = 3_600_000;
 
+/** Quanto o novo pareamento espera o WhatsApp confirmar o logout do aparelho antigo. */
+const LOGOUT_TIMEOUT_MS = 5_000;
+
+const DAY_MS = 86_400_000;
+
 /**
- * De onde veio a mensagem: `live` (chegou agora) ou `offline` (fila entregue na
- * reconexão, o Baileys marca como `append`).
+ * De onde veio a mensagem: `live` (chegou agora), `offline` (fila entregue na reconexão,
+ * o Baileys marca como `append`) ou `history` (sincronização do pareamento).
  */
-type IngestSource = 'live' | 'offline';
+type IngestSource = 'live' | 'offline' | 'history';
+
+/** Status, newsletter e listas de transmissão não são conversa: ficam fora do histórico. */
+function isBroadcastJid(jid: string): boolean {
+  return jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter');
+}
+
+/**
+ * Normaliza o `message-capping.update`: os números vêm como número ou texto, e o fim do
+ * ciclo em segundos ou milissegundos.
+ */
+export function toNewChatQuota(info: Record<string, unknown>, receivedAt: number): NewChatQuota {
+  const num = (v: unknown): number | null => {
+    const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : typeof v === 'number' ? v : NaN;
+    return Number.isFinite(n) ? n : null;
+  };
+  const cycleEnd = num(info.cycle_end_timestamp);
+  return {
+    total: num(info.total_quota),
+    used: num(info.used_quota),
+    status: typeof info.capping_status === 'string' ? info.capping_status : null,
+    cycleEndsAt: cycleEnd === null ? null : cycleEnd < 1e12 ? cycleEnd * 1000 : cycleEnd,
+    receivedAt,
+  };
+}
 
 /**
  * `JSON.parse` que devolve `Buffer` onde o `JSON.stringify` gravou `{ type: 'Buffer', data }`.
@@ -86,8 +117,8 @@ function normalizeJid(jid: string): string {
  * Converte um participante do `groupMetadata` no registro que persistimos.
  *
  * `id` é o identificador de endereçamento do grupo (telefone nos grupos antigos, LID
- * nos novos) e é o que precisa ir em `mentionedJid`. `jid` (quando vem) é o telefone
- * real, guardado só para o preview mostrar um número verdadeiro em vez do LID.
+ * nos novos) e é o que precisa ir em `mentionedJid`. `phoneNumber` (quando vem) é o
+ * telefone real, guardado só para o preview mostrar um número verdadeiro em vez do LID.
  */
 function toParticipantRecord(p: BaileysGroupParticipant): {
   jid: string;
@@ -96,7 +127,7 @@ function toParticipantRecord(p: BaileysGroupParticipant): {
   isAdmin: boolean;
 } {
   const jid = normalizeJid(p.id);
-  const phoneFromField = p.jid ? normalizeJid(p.jid) : null;
+  const phoneFromField = p.phoneNumber ? normalizeJid(p.phoneNumber) : null;
   const phoneJid = phoneFromField ?? (jid.endsWith('@s.whatsapp.net') ? jid : null);
   return {
     jid,
@@ -116,6 +147,22 @@ function unwrapMessage(message: WAMessageContent): WAMessageContent {
     message.viewOnceMessage?.message ??
     message.viewOnceMessageV2Extension?.message;
   return (inner as WAMessageContent | null | undefined) ?? message;
+}
+
+/** Verdadeiro para mensagem de sincronização entre os aparelhos da conta (ver `protocol.ts`). */
+function isDeviceSyncMessage(message: WAMessageContent): boolean {
+  return isDeviceSyncProtocolType(unwrapMessage(message).protocolMessage?.type);
+}
+
+/**
+ * Verdadeiro para mensagem sem conteúdo próprio: o cabeçalho de um álbum (`albumMessage`,
+ * que só avisa quantas fotos vêm; cada foto chega como mensagem normal) e a cópia de uma
+ * mídia que já chegou (versão HD, foto com movimento; ver `protocol.ts`).
+ */
+function isRedundantMessage(message: WAMessageContent): boolean {
+  if (message.albumMessage) return true;
+  if (!message.associatedChildMessage) return false;
+  return isMediaCopyAssociation(message.messageContextInfo?.messageAssociation?.associationType);
 }
 
 /** Verdadeiro se a mensagem (ainda embrulhada) for um envio `viewOnce`. */
@@ -197,14 +244,19 @@ function guessMimeFromExt(filePath: string): string {
 }
 
 /**
- * Extrai de `key.senderPn` o telefone real por trás de um LID (`@lid`). O WhatsApp
- * passou a endereçar conversas por identificador opaco; sem este campo não há como
- * mostrar um número verdadeiro no preview do gate.
+ * Extrai da chave o telefone real por trás de um LID (`@lid`). O WhatsApp passou a
+ * endereçar conversas por identificador opaco; sem isso não há como mostrar um número
+ * verdadeiro no preview do gate. O Baileys 7 manda o outro endereço em `remoteJidAlt`
+ * (conversa) e `participantAlt` (grupo), que pode ser o telefone ou o LID: vale só o que
+ * termina em `@s.whatsapp.net`. `senderPn` e `participantPn` são do Baileys 6.
  */
 function extractSenderPn(raw: WAMessage): string | null {
   const key = raw.key as unknown as Record<string, unknown>;
-  const pn = key.senderPn ?? key.participantPn;
-  return typeof pn === 'string' && pn.length > 0 ? normalizeJid(pn) : null;
+  for (const field of ['senderPn', 'participantPn', 'remoteJidAlt', 'participantAlt']) {
+    const value = key[field];
+    if (typeof value === 'string' && value.endsWith('@s.whatsapp.net')) return normalizeJid(value);
+  }
+  return null;
 }
 
 /** Cache LRU simples por `Map` (ordem de inserção == ordem de acesso recente). */
@@ -235,6 +287,10 @@ export interface WhatsAppConnectionDeps {
   log: Logger;
   metrics: Metrics;
   home: string;
+  /** Dias de histórico importados no pareamento; `0` desliga a importação. */
+  historyDays: number;
+  /** Nome em "Aparelhos conectados" no celular; o WhatsApp só lê no pareamento. */
+  deviceName: string;
 }
 
 /** Conexão Baileys com o WhatsApp, única para todo o daemon. */
@@ -242,6 +298,8 @@ export class WhatsAppConnection {
   private readonly store: Store;
   private readonly log: Logger;
   private readonly authDir: string;
+  private readonly historyDays: number;
+  private readonly deviceName: string;
   /** Ligado por `close()`: a partir daí nenhuma reconexão é agendada. */
   private closed = false;
 
@@ -252,11 +310,15 @@ export class WhatsAppConnection {
   private readonly subscribedPresence = new Set<string>();
   private readonly rawMessages = new LruCache<WAMessageContent>(RAW_MESSAGE_CACHE_LIMIT);
   private readonly listeners: Array<(m: StoredMessage, raw: WAMessageContent) => void> = [];
+  /** Última cota de conversas novas que o WhatsApp mandou; some quando o ciclo acaba. */
+  private newChatQuota: NewChatQuota | null = null;
 
   constructor(deps: WhatsAppConnectionDeps) {
     this.store = deps.store;
     this.log = deps.log;
     this.authDir = join(deps.home, 'auth');
+    this.historyDays = deps.historyDays;
+    this.deviceName = deps.deviceName;
   }
 
   /** Abre a conexão com o WhatsApp, restaurando credenciais salvas quando existirem. */
@@ -286,15 +348,36 @@ export class WhatsAppConnection {
         { level: this.log.level === 'debug' || this.log.level === 'trace' ? this.log.level : 'warn' },
       ),
       version,
-      browser: Browsers.macOS('Chrome'),
+      // O padrão do Baileys marca a conta como online ao conectar. Com um aparelho online o
+      // celular para de notificar, e o daemon fica conectado o tempo todo: o celular do
+      // usuário nunca mais tocaria. O daemon só recebe e lê sob demanda, sem aparecer online.
+      markOnlineOnConnect: false,
+      // O primeiro item vira o nome em "Aparelhos conectados" ("Google Chrome (wa-bridge)"),
+      // para não confundir com o WhatsApp Web do próprio usuário. O celular grava o nome no
+      // pareamento: trocar aqui só aparece depois de parear de novo.
+      browser: [this.deviceName, ...Browsers.macOS('Chrome').slice(1)] as [string, string, string],
       // O Baileys pede o conteúdo de uma mensagem já enviada quando o destinatário não
       // conseguiu decifrá-la e pede reenvio (e para decifrar voto de enquete). Devolver
       // `undefined` deixa a pessoa vendo "Aguardando mensagem" para sempre.
       getMessage: async (key) => this.lookupMessageContent(key.id),
+      // O Baileys 7 liga a sincronização completa por padrão: o celular mandaria anos de
+      // conversa para o daemon descartar quase tudo (fica só `WA_HISTORY_DAYS`). Sem ela o
+      // celular ainda manda o histórico recente, que o padrão de `shouldSyncHistoryMessage`
+      // processa. Não sobrescreva essa função recusando tudo: o Baileys tira do histórico o
+      // mapeamento LID -> telefone e avisa no log que a sessão fica instável sem ele.
+      syncFullHistory: false,
     });
     this.socket = socket;
 
     socket.ev.on('creds.update', saveCreds);
+
+    // O WhatsApp avisa quantas conversas novas a conta ainda pode iniciar no ciclo. O gate
+    // usa isso para parar antes do limite dele, não depois.
+    socket.ev.on('message-capping.update', (info) => {
+      if (socket !== this.socket) return;
+      this.newChatQuota = toNewChatQuota(info as unknown as Record<string, unknown>, Date.now());
+      this.log.info({ cota: this.newChatQuota }, 'cota de conversas novas do WhatsApp atualizada');
+    });
 
     // Grupo renomeado, ou entrada em grupo novo: mantém `chats.name` atual sem precisar
     // de um novo sync completo.
@@ -338,6 +421,54 @@ export class WhatsAppConnection {
       const source: IngestSource = type === 'notify' ? 'live' : 'offline';
       for (const message of messages) this.handleIncomingMessage(message, source);
     });
+    socket.ev.on('messaging-history.set', ({ messages, chats, syncType, progress }) => {
+      if (socket !== this.socket) return;
+      this.importHistory(messages, chats, { syncType: syncType ?? null, progress: progress ?? null });
+    });
+  }
+
+  /**
+   * Importa o histórico que o celular manda logo depois do pareamento, só dos últimos
+   * `historyDays` dias. O WhatsApp manda isso uma vez por pareamento: numa sessão que já
+   * estava pareada, o histórico só chega pareando de novo (`./wa-bridge pair`).
+   *
+   * Histórico não é mensagem nova: não soma em não lidas, não sobrescreve o que já está
+   * no banco e não dispara `onMessage` (nem o stream de eventos).
+   */
+  private importHistory(
+    messages: WAMessage[],
+    chats: Chat[],
+    meta: { syncType: number | null; progress: number | null },
+  ): void {
+    if (this.historyDays <= 0) return;
+    const cutoffMs = Date.now() - this.historyDays * DAY_MS;
+    let imported = 0;
+    for (const raw of messages) {
+      const remoteJid = raw.key.remoteJid;
+      if (!remoteJid || isBroadcastJid(remoteJid)) continue;
+      if (toNumber(raw.messageTimestamp) * 1000 < cutoffMs) continue;
+      try {
+        if (this.handleIncomingMessage(raw, 'history')) imported += 1;
+      } catch (error) {
+        this.log.warn({ error, id: raw.key.id }, 'falha ao importar mensagem do histórico');
+      }
+    }
+    for (const chat of chats) {
+      if (!chat.id || isBroadcastJid(chat.id) || !chat.name?.trim()) continue;
+      if (toNumber(chat.conversationTimestamp) * 1000 < cutoffMs) continue;
+      const jid = normalizeJid(chat.id);
+      this.store.upsertChat({
+        jid,
+        name: chat.name.trim(),
+        isGroup: isJidGroup(jid) ?? false,
+        lastMessageAt: null,
+        unreadCount: 0,
+      });
+    }
+    this.log.info(
+      { importadas: imported, recebidas: messages.length, dias: this.historyDays, ...meta },
+      'histórico do WhatsApp importado',
+    );
   }
 
   /** Conteúdo de uma mensagem já vista (cache em memória ou `raw_json`), para o Baileys reenviar. */
@@ -366,6 +497,40 @@ export class WhatsAppConnection {
       this.reconnectTimer = null;
     }
     this.retireSocket();
+  }
+
+  /**
+   * Aposenta o socket atual e faz `logout`, que tira este aparelho de "Aparelhos
+   * conectados" no celular. Sem isso, cada novo pareamento deixava o aparelho antigo na
+   * lista. Melhor esforço: sem conexão aberta o logout falha, e o aparelho antigo fica lá
+   * até ser removido à mão.
+   */
+  private async unlinkSocket(): Promise<void> {
+    const previous = this.socket;
+    // Antes do logout: o `close` que ele dispara chega com o socket já aposentado e é ignorado.
+    this.socket = null;
+    if (!previous) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        previous.logout(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('logout sem resposta')), LOGOUT_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (error) {
+      this.log.warn(
+        { error },
+        'não deu para desvincular o aparelho antigo; remova-o no celular em Aparelhos conectados',
+      );
+    } finally {
+      clearTimeout(timer);
+      try {
+        previous.end(undefined);
+      } catch (error) {
+        this.log.error({ error }, 'erro ao encerrar o socket anterior');
+      }
+    }
   }
 
   /** Desliga o socket atual sem que o `close` dele dispare reconexão (o handler o ignora). */
@@ -563,8 +728,8 @@ export class WhatsAppConnection {
 
   /**
    * Converte e persiste uma mensagem, e notifica os callbacks registrados. Devolve `true`
-   * se a mensagem foi gravada. A fila offline só grava o que ainda não existe (pode
-   * repetir mensagens já vistas) e só o que é novo mexe em contadores.
+   * se a mensagem foi gravada. Histórico e fila offline só gravam o que ainda não existe
+   * (podem repetir mensagens já vistas) e só o que é novo mexe em contadores.
    */
   private handleIncomingMessage(raw: WAMessage, source: IngestSource = 'live'): boolean {
     const remoteJid = raw.key.remoteJid;
@@ -578,12 +743,15 @@ export class WhatsAppConnection {
     } else if (!this.store.insertMessageIfNew(stored, JSON.stringify(raw))) {
       return false;
     }
-    if (raw.message) this.rawMessages.set(stored.id, raw.message);
+    // Histórico não entra no cache em memória: são milhares de mensagens de uma vez e
+    // expulsariam as recentes. A mídia dele sai do `raw_json` persistido.
+    if (raw.message && source !== 'history') this.rawMessages.set(stored.id, raw.message);
 
     // `senderPn` é o telefone real por trás de um LID (`@lid`). É o único jeito de o
     // preview do gate mostrar um número verdadeiro em vez de formatar o LID como telefone.
-    this.updateChatAndContact(stored, extractSenderPn(raw));
+    this.updateChatAndContact(stored, extractSenderPn(raw), source !== 'history');
 
+    if (source === 'history') return true;
     this.log.debug({ chat: stored.chatJid, type: stored.type, source }, 'mensagem recebida');
 
     for (const cb of this.listeners) {
@@ -596,15 +764,18 @@ export class WhatsAppConnection {
     return true;
   }
 
-  /** Atualiza os registros de `chats` e `contacts` a partir de uma mensagem normalizada. */
-  private updateChatAndContact(m: StoredMessage, senderPn: string | null = null): void {
+  /**
+   * Atualiza os registros de `chats` e `contacts` a partir de uma mensagem normalizada.
+   * `countUnread = false` (histórico) registra a conversa sem somar em não lidas.
+   */
+  private updateChatAndContact(m: StoredMessage, senderPn: string | null = null, countUnread = true): void {
     const isGroup = isJidGroup(m.chatJid) ?? false;
     this.store.upsertChat({
       jid: m.chatJid,
       name: null,
       isGroup,
       lastMessageAt: m.ts,
-      unreadCount: m.fromMe ? 0 : 1,
+      unreadCount: m.fromMe || !countUnread ? 0 : 1,
     });
 
     if (m.senderJid) {
@@ -634,7 +805,7 @@ export class WhatsAppConnection {
 
   /** Converte uma mensagem bruta do Baileys em `StoredMessage`. */
   private parseMessage(raw: WAMessage, remoteJid: string): StoredMessage | null {
-    if (!raw.message) return null;
+    if (!raw.message || isDeviceSyncMessage(raw.message) || isRedundantMessage(raw.message)) return null;
     const chatJid = normalizeJid(remoteJid);
     const fromMe = raw.key.fromMe ?? false;
     const senderJid = fromMe
@@ -669,14 +840,25 @@ export class WhatsAppConnection {
     return this.sessionState;
   }
 
-  /** Encerra o socket, apaga as credenciais salvas e reconecta para gerar um QR novo. */
+  /** Cota de conversas novas vigente, ou `null` se o WhatsApp nunca mandou ou o ciclo acabou. */
+  getNewChatQuota(now = Date.now()): NewChatQuota | null {
+    const quota = this.newChatQuota;
+    if (!quota) return null;
+    if (quota.cycleEndsAt !== null && quota.cycleEndsAt <= now) return null;
+    return quota;
+  }
+
+  /**
+   * Desvincula o aparelho atual, apaga as credenciais salvas e reconecta para gerar um QR
+   * novo.
+   */
   async forcePair(): Promise<void> {
-    this.log.warn('forcePair: apagando credenciais e forçando novo pareamento');
+    this.log.warn('forcePair: desvinculando o aparelho atual e forçando novo pareamento');
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.retireSocket();
+    await this.unlinkSocket();
     await rm(this.authDir, { recursive: true, force: true });
     this.sessionState = { state: 'connecting', me: null, qrDataUrl: null, since: Date.now(), lastError: null };
     await this.connect();
@@ -848,8 +1030,11 @@ export class WhatsAppConnection {
     return { document: url, mimetype: mime, fileName: filePath.split('/').pop() ?? 'arquivo', caption };
   }
 
-  /** Atualiza a presença (`composing`/`paused`/`available`) em um chat. */
-  async setPresence(chatJid: string, p: 'composing' | 'paused' | 'available'): Promise<void> {
+  /**
+   * Atualiza o estado de digitação (`composing`/`paused`) em um chat. Não aceita
+   * `available`: a conta online faz o celular parar de notificar.
+   */
+  async setPresence(chatJid: string, p: 'composing' | 'paused'): Promise<void> {
     const socket = this.requireSocket();
     await this.ensurePresenceSubscribed(socket, chatJid);
     await socket.sendPresenceUpdate(p, chatJid);

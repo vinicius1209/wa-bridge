@@ -38,16 +38,25 @@ o WhatsApp com `device_removed`, então os agentes não podem abrir conexões pr
 
 O que vem junto:
 
-- **13 tools MCP**: listar conversas, ler mensagens, baixar e transcrever mídia,
-  resolver contatos e grupos por nome, enviar texto e mídia, citar mensagens, @marcar
-  pessoas em grupo, reagir, marcar como lido, cancelar envio.
+- **14 tools MCP**: listar conversas, ler mensagens, buscar em todas as conversas
+  (texto e transcrições), baixar e transcrever mídia, resolver contatos e grupos por nome,
+  enviar texto e mídia, citar mensagens, @marcar pessoas em grupo, reagir, marcar como
+  lido, cancelar envio.
+- **Histórico de 7 dias** importado no pareamento, e as mensagens que chegam com o daemon
+  parado entram quando ele volta.
+- **Stream de mensagens novas** (`GET /events`, Server-Sent Events) para notificação,
+  scripts ou um agente escutando: `./wa-bridge events`.
 - **Gate de envio**: rascunho → humano aprova → envio. Avisos para número nunca
   contatado, horário de silêncio e grupo; limite de 10 envios por hora; 1 rascunho por
   conversa; blocklist.
 - **Digitação simulada**: o envio aparece como "digitando...", quebrado em balões, com
   uma janela para cancelar antes de terminar.
-- **Painel** em `http://127.0.0.1:7788/dashboard/`: QR de pareamento, estado da sessão,
-  métricas por agente e trilha de auditoria de todo envio.
+- **Painel** em `http://127.0.0.1:7788/dashboard/` (`./wa-bridge open`): sessão e QR de
+  pareamento, envios usados na hora e horário de silêncio, rascunhos esperando aprovação
+  (dá para descartar), envios em andamento (dá para cancelar), mensagens chegando ao vivo,
+  busca com ⌘K, métricas por agente e por tool, auditoria e a saúde da instalação. No
+  iPhone, vira app na Tela de Início (acesso por VPN privada, ver
+  [`docs/OPERACAO.md`](docs/OPERACAO.md#painel-no-celular)).
 
 ## Instalar
 
@@ -75,7 +84,8 @@ cd wa-bridge
 ./wa-bridge open         # abre o painel com o QR
 ```
 
-No celular: **WhatsApp > Aparelhos conectados > Conectar aparelho** e escaneie o QR. A
+No celular: **WhatsApp > Aparelhos conectados > Conectar aparelho** e escaneie o QR. Na
+lista, o daemon aparece como **Google Chrome (wa-bridge)** (`WA_DEVICE_NAME`). A
 sessão fica salva em `~/.wa-bridge/auth/`; não precisa escanear de novo a cada boot.
 
 Modelo menor (mais rápido, transcreve pior): `./wa-bridge setup --model small`.
@@ -108,10 +118,11 @@ segurança).
 | `./wa-bridge setup [--model NOME \| --no-model]` | instala dependências, compila e baixa o modelo do whisper |
 | `./wa-bridge start` / `stop` / `restart` | sobe, para e reinicia o daemon (pelo launchd, se o serviço estiver instalado) |
 | `./wa-bridge service install\|uninstall\|status` | daemon como serviço do macOS: sobe no login e reinicia se cair |
+| `./wa-bridge events [--from-me] [--chat JID]` | acompanha as mensagens novas em tempo real |
 | `./wa-bridge status` | processo e estado da sessão do WhatsApp |
 | `./wa-bridge open` | abre o painel já autenticado |
 | `./wa-bridge qr` | salva o QR de pareamento como PNG e abre |
-| `./wa-bridge pair [--yes]` | descarta a sessão (com backup) e gera um QR novo |
+| `./wa-bridge pair [--yes]` | desvincula o aparelho no celular e gera um QR novo |
 | `./wa-bridge mcp-config` | config MCP pronta para cada agente |
 | `./wa-bridge logs` | acompanha os logs |
 | `./wa-bridge token` | copia o token da API |
@@ -172,8 +183,14 @@ falando. Nunca compartilhe `auth/` entre instâncias.
 - **API só em `127.0.0.1`**, com token Bearer. O painel estático abre sem token, mas
   todo dado exige token.
 - **Auditoria append-only** de todo rascunho, envio, bloqueio e cancelamento.
-- A digitação simulada existe para quem recebe e para dar tempo de cancelar. **Não é
-  proteção contra banimento**: não existe proteção contra banimento.
+- **Nunca aparece online.** O daemon conecta sem se marcar como disponível e, ao enviar,
+  só mostra "digitando" na conversa. Um aparelho online faz o celular parar de notificar.
+- **Limites de volume**: 10 envios por hora, 40 por dia, 30s entre envios para a mesma
+  conversa e 3 conversas novas por dia, além de respeitar a cota de conversas novas que o
+  próprio WhatsApp informa. Tudo ajustável no `.env`.
+- A digitação simulada existe para quem recebe e para dar tempo de cancelar. **Nada aqui é
+  proteção garantida contra banimento**: as regras do WhatsApp não são públicas. Os limites
+  só tiram do caminho os padrões que mais chamam atenção.
 
 ## Docker
 

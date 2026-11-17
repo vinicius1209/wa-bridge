@@ -3,13 +3,23 @@
  * (consumo único do token). Esta é a parte mais sensível do daemon — ver os
  * invariantes de segurança em docs/ARQUITETURA.md ("Gate de envio").
  */
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { isQuietHour, maskNumber, type Config } from '../config.js';
 import type { Audit } from '../obs/audit.js';
 import type { Metrics } from '../obs/metrics.js';
 import type { DraftRecord, Store } from '../store/store.js';
-import type { DraftInput, Logger, MentionPreview, SendDraft, SendWarning } from '../types.js';
+import type {
+  ActiveSendView,
+  DraftInput,
+  GateSnapshot,
+  Logger,
+  MentionPreview,
+  PendingDraftView,
+  SendDraft,
+  SendWarning,
+  NewChatQuota,
+} from '../types.js';
 import type { WhatsAppConnection } from '../whatsapp/connection.js';
 import { isBlocked as isBlockedJid } from './blocklist.js';
 import { AppError } from './errors.js';
@@ -24,6 +34,29 @@ import {
 const LARGE_TEXT_THRESHOLD = 1200;
 const AMBIGUITY_SCORE_GAP = 0.15;
 const ONE_HOUR_MS = 3_600_000;
+const ONE_DAY_MS = 86_400_000;
+/** Quanto da cota de conversas novas do WhatsApp fica de reserva (mínimo 1). */
+const NEW_CHAT_QUOTA_RESERVE = 0.1;
+
+/** Qual limite de volume barrou o envio (vai em `detail.scope` do `RATE_LIMITED`). */
+type LimitScope = 'hour' | 'day' | 'chat' | 'new_contacts' | 'whatsapp_quota';
+
+interface ExceededLimit {
+  scope: LimitScope;
+  message: string;
+  retryAfterMs?: number;
+}
+
+/**
+ * Verdadeiro quando a cota de conversas novas do WhatsApp acabou ou está na reserva: o
+ * gate para antes do limite dele, não depois. `CAPPED` vale mesmo sem os números.
+ */
+export function newChatQuotaExhausted(quota: NewChatQuota): boolean {
+  if (quota.status === 'CAPPED') return true;
+  if (quota.total === null || quota.used === null) return false;
+  const reserve = Math.max(1, Math.ceil(quota.total * NEW_CHAT_QUOTA_RESERVE));
+  return quota.total - quota.used <= reserve;
+}
 
 /** Contexto de chamada (quem está chamando e o traceId da requisição HTTP). */
 export interface CallCtx {
@@ -47,6 +80,14 @@ interface DraftPayload {
   mentions: ResolvedMention[];
   warnings: SendWarning[];
   estimatedDelayMs: number;
+}
+
+/**
+ * Id que o painel usa para um rascunho: hash do token de confirmação. Serve para
+ * descartar e não serve para confirmar, então o token nunca precisa sair do gate.
+ */
+export function draftIdFor(confirmToken: string): string {
+  return createHash('sha256').update(confirmToken).digest('hex').slice(0, 16);
 }
 
 /** Estado de aborto em memória para um envio em andamento (o processo é único). */
@@ -185,6 +226,61 @@ export class SendGate {
     }
   }
 
+  /**
+   * Limites de volume, checados no rascunho e de novo no confirm. Devolve o primeiro que
+   * estourou, ou `null`. Nenhum garante nada contra ban: tiram do caminho os padrões que
+   * mais chamam atenção (rajada, volume alto, conversa nova em série). O intervalo por
+   * conversa só vale no confirm: no rascunho ele travaria o agente enquanto o humano lê.
+   */
+  private exceededLimit(jid: string, firstContact: boolean, now: number, stage: 'draft' | 'confirm'): ExceededLimit | null {
+    const { sendsPerHour, sendsPerDay, newContactsPerDay, chatMinIntervalMs } = this.config;
+    if (this.store.countSendsSince(now - ONE_HOUR_MS) >= sendsPerHour) {
+      return { scope: 'hour', message: `limite de ${sendsPerHour} envios/hora atingido` };
+    }
+    if (this.store.countSendsSince(now - ONE_DAY_MS) >= sendsPerDay) {
+      return { scope: 'day', message: `limite de ${sendsPerDay} envios/dia atingido` };
+    }
+    if (stage === 'confirm' && chatMinIntervalMs > 0) {
+      const last = this.store.lastSendToChatAt(jid);
+      if (last !== null && now - last < chatMinIntervalMs) {
+        const retryAfterMs = last + chatMinIntervalMs - now;
+        return {
+          scope: 'chat',
+          message: `espere ${Math.ceil(retryAfterMs / 1000)}s para mandar de novo nesta conversa`,
+          retryAfterMs,
+        };
+      }
+    }
+    if (firstContact) {
+      if (this.store.countFirstContactSendsSince(now - ONE_DAY_MS) >= newContactsPerDay) {
+        return {
+          scope: 'new_contacts',
+          message:
+            newContactsPerDay === 0
+              ? 'iniciar conversa nova está desligado (WA_NEW_CONTACTS_PER_DAY=0)'
+              : `limite de ${newContactsPerDay} conversas novas por dia atingido`,
+        };
+      }
+      const quota = this.wa.getNewChatQuota(now);
+      if (quota && newChatQuotaExhausted(quota)) {
+        const numbers = quota.total !== null && quota.used !== null ? ` (${quota.used} de ${quota.total})` : '';
+        return {
+          scope: 'whatsapp_quota',
+          message: `o WhatsApp está limitando as conversas novas desta conta${numbers}`,
+        };
+      }
+    }
+    return null;
+  }
+
+  /** `RATE_LIMITED` com o limite que estourou em `detail`. */
+  private rateLimited(limit: ExceededLimit): AppError {
+    return new AppError('RATE_LIMITED', 429, limit.message, {
+      scope: limit.scope,
+      ...(limit.retryAfterMs !== undefined ? { retryAfterMs: limit.retryAfterMs } : {}),
+    });
+  }
+
   /** Cria um rascunho de envio: resolve destino, valida blocklist/rate-limit e monta o preview. */
   async draft(input: DraftInput, ctx: CallCtx = {}): Promise<SendDraft> {
     const agent = ctx.agent ?? 'unknown';
@@ -229,10 +325,8 @@ export class SendGate {
       });
     }
 
-    const sentLastHour = this.store.countSendsSince(now - ONE_HOUR_MS);
-    if (sentLastHour >= this.config.sendsPerHour) {
-      throw new AppError('RATE_LIMITED', 429, `limite de ${this.config.sendsPerHour} envios/hora atingido`);
-    }
+    const limit = this.exceededLimit(jid, resolved.lastContactAt === null, now, 'draft');
+    if (limit) throw this.rateLimited(limit);
 
     // Validar a citação ANTES de montar o rascunho. Duas razões: citar uma mensagem de
     // OUTRA conversa vazaria o conteúdo dela para este chat, e citar um id inexistente
@@ -410,12 +504,13 @@ export class SendGate {
 
     if (payload.mediaPath) this.assertMediaReadable(payload.mediaPath);
 
-    // Rate limit TAMBÉM aqui, não só no draft. As linhas de `sends` só nascem no confirm,
+    // Limites TAMBÉM aqui, não só no draft. As linhas de `sends` só nascem no confirm,
     // então checar apenas no draft é furado: dá para criar N rascunhos em N chats enquanto
     // o contador está em zero e confirmar todos depois, estourando o limite à vontade.
     // O confirm é onde a mensagem realmente sai, logo é onde o limite precisa valer.
-    const sentLastHour = this.store.countSendsSince(now - ONE_HOUR_MS);
-    if (sentLastHour >= this.config.sendsPerHour) {
+    const firstContact = payload.warnings.includes('NEVER_CONTACTED');
+    const limit = this.exceededLimit(jid, firstContact, now, 'confirm');
+    if (limit) {
       this.audit.record({
         ts: now,
         traceId,
@@ -423,9 +518,9 @@ export class SendGate {
         action: 'send.blocked',
         chatJid: jid,
         outcome: 'denied',
-        detail: { reason: 'RATE_LIMITED', stage: 'confirm', sentLastHour },
+        detail: { reason: 'RATE_LIMITED', scope: limit.scope, stage: 'confirm' },
       });
-      throw new AppError('RATE_LIMITED', 429, `limite de ${this.config.sendsPerHour} envios/hora atingido`);
+      throw this.rateLimited(limit);
     }
 
     // Consumo atômico: UPDATE ... WHERE status='pending' AND expires_at > now, checando
@@ -449,6 +544,7 @@ export class SendGate {
       bubblesSent: 0,
       cancelled: false,
       messageIdsJson: '[]',
+      firstContact,
     });
     this.abortFlags.set(sendId, { abort: false });
 
@@ -573,6 +669,9 @@ export class SendGate {
       });
     } finally {
       this.abortFlags.delete(sendId);
+      // Envio só de mídia (ou que falhou no meio) não passa pelo fim do plano: encerra o
+      // "digitando" aqui. Melhor esforço, sem socket não há o que encerrar.
+      await this.wa.setPresence(jid, 'paused').catch(() => {});
     }
   }
 
@@ -620,6 +719,61 @@ export class SendGate {
       detail: { stage: 'draft', discarded },
     });
     return { discarded };
+  }
+
+  /**
+   * Retrato do gate para o painel: uso do limite por hora, horário de silêncio,
+   * rascunhos esperando aprovação (sem o token) e envios em execução.
+   */
+  snapshot(now: number = Date.now()): GateSnapshot {
+    const drafts: PendingDraftView[] = this.store.listPendingDrafts(now).map((d) => {
+      const payload = JSON.parse(d.payloadJson) as DraftPayload;
+      return {
+        id: draftIdFor(d.confirmToken),
+        chatJid: d.chatJid,
+        name: this.store.getChatName(d.chatJid),
+        maskedNumber: maskNumber(this.store.phoneFor(d.chatJid)),
+        bubbles: payload.bubbles,
+        mediaPath: payload.mediaPath,
+        warnings: payload.warnings,
+        mentions: payload.mentions?.length ?? 0,
+        agent: d.agent,
+        createdAt: d.createdAt,
+        expiresAt: d.expiresAt,
+      };
+    });
+    // Em execução é quem tem abort flag em memória: o `stage` do banco de um envio que
+    // morreu com o processo anterior não volta a andar.
+    const sends: ActiveSendView[] = [];
+    for (const sendId of this.abortFlags.keys()) {
+      const s = this.store.getSend(sendId);
+      if (!s) continue;
+      sends.push({
+        sendId: s.sendId,
+        chatJid: s.chatJid,
+        name: this.store.getChatName(s.chatJid),
+        stage: s.stage,
+        bubblesTotal: s.bubblesTotal ?? 0,
+        bubblesSent: s.bubblesSent ?? 0,
+        agent: s.agent,
+        startedAt: s.startedAt,
+      });
+    }
+    return {
+      sendsLastHour: this.store.countSendsSince(now - ONE_HOUR_MS),
+      sendsPerHour: this.config.sendsPerHour,
+      quietHours: { active: isQuietHour(this.config, new Date(now)), window: this.config.quietHours.raw },
+      draftTtlMs: this.config.draftTtlMs,
+      drafts,
+      sends,
+    };
+  }
+
+  /** Descarta um rascunho pelo id do painel (`draftIdFor`), sem expor o token de confirmação. */
+  async discardDraftById(id: string, ctx: CallCtx = {}): Promise<{ discarded: boolean }> {
+    const draft = this.store.listPendingDrafts(Date.now()).find((d) => draftIdFor(d.confirmToken) === id);
+    if (!draft) throw new AppError('DRAFT_NOT_FOUND', 404, 'rascunho não encontrado ou já expirado');
+    return this.discardDraft(draft.confirmToken, ctx);
   }
 
   /** Marca o abort flag de um envio em andamento; `shouldAbort()` do plano em execução o vê. */

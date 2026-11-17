@@ -136,7 +136,7 @@ printf '%s\n%s\n%s\n' \
  | ./bin/wa-bridge-mcp | grep -o '"name":"wa_[a-z_]*"' | sort -u | wc -l
 ```
 
-Deve imprimir `13`.
+Deve imprimir `14`.
 
 ## 7. Ensinar o agente a usar
 
@@ -167,8 +167,10 @@ e `whatsapp: conectado`.
 Peça ao humano para reiniciar o agente (o MCP só carrega em sessão nova). Na sessão nova:
 
 1. `wa_session_status` → `state: "open"`.
-2. `wa_list_chats({ limit: 5 })` → lista conversas. Logo depois do pareamento a lista
-   pode vir curta: o daemon só registra mensagens que chegam enquanto ele está rodando.
+2. `wa_list_chats({ limit: 5 })` → lista conversas. No pareamento o daemon importa os
+   últimos 7 dias de histórico (`WA_HISTORY_DAYS`), que o celular manda aos poucos nos
+   primeiros minutos; conversas mais antigas só aparecem quando chegar mensagem nova.
+3. `wa_search({ q: "oi", limit: 3 })` → devolve `hits` (pode vir vazio, não é erro).
 
 Pronto. Resuma para o humano: onde ficou instalado, como ver o estado
 (`./wa-bridge status`), como abrir o painel (`./wa-bridge open`) e que o daemon não sobe

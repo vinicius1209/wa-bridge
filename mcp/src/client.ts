@@ -2,11 +2,19 @@
  * Cliente HTTP stateless que fala com o daemon wa-bridge via fetch nativo.
  * Nenhuma lógica de negócio aqui — só transporte, auth e tradução de erro.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const DEFAULT_URL = 'http://127.0.0.1:7788';
+
+/**
+ * Tool MCP em execução. Vai no header `X-WA-Tool` para o daemon registrar nas métricas o
+ * nome da tool (`wa_read_messages`) em vez da rota HTTP. Contexto assíncrono, e não uma
+ * variável global, porque o cliente pode chamar várias tools ao mesmo tempo.
+ */
+export const currentTool = new AsyncLocalStorage<string>();
 const DEFAULT_TIMEOUT_MS = 30_000;
 /** Timeout estendido para /media/:id — transcrição local de vídeo é lenta. */
 export const MEDIA_TIMEOUT_MS = 360_000;
@@ -129,6 +137,7 @@ export async function requestDaemon<T>(opts: RequestOptions): Promise<T> {
       headers: {
         Authorization: `Bearer ${token}`,
         'X-WA-Agent': resolveAgentName(),
+        ...(currentTool.getStore() ? { 'X-WA-Tool': currentTool.getStore() } : {}),
         ...(opts.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,

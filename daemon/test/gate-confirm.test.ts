@@ -43,6 +43,7 @@ before(() => {
     getGroupParticipants: async () => [],
     buildQuoted: () => undefined,
     setPresence: async () => {},
+    getNewChatQuota: () => null,
     sendText: async (_jid: string, text: string) => {
       enviados.push(text);
       return `id-${enviados.length}`;

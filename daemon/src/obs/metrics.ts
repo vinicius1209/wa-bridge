@@ -8,7 +8,7 @@
  * 50 registros, com flush síncrono final em `beforeExit`.
  */
 import type { Store } from '../store/store.js';
-import type { AuditEvent, CallRecord, MetricsSummary, SessionState } from '../types.js';
+import type { AuditEvent, CallRecord, MetricsSummary, MetricsTotals, SessionState } from '../types.js';
 
 /** Intervalo máximo entre flushes do buffer de chamadas. */
 const FLUSH_INTERVAL_MS = 500;
@@ -123,13 +123,20 @@ export class Metrics {
     const generatedAt = Date.now();
     const since = generatedAt - windowMs;
 
-    const calls = this.store.callsSince(since); // consulta indexada (idx_metrics_ts)
-    const audits = this.store.auditSince(since); // consulta indexada (idx_audit_ts)
+    // Uma consulta cobre a janela atual e a anterior (para a variação no painel).
+    const callsBoth = this.store.callsSince(since - windowMs); // consulta indexada (idx_metrics_ts)
+    const auditsBoth = this.store.auditSince(since - windowMs); // consulta indexada (idx_audit_ts)
+    const calls = callsBoth.filter((c) => c.ts >= since);
+    const audits = auditsBoth.filter((a) => a.ts >= since);
 
     return {
       windowMs,
       generatedAt,
       totals: this.computeTotals(calls, audits),
+      previousTotals: this.computeTotals(
+        callsBoth.filter((c) => c.ts < since),
+        auditsBoth.filter((a) => a.ts < since),
+      ),
       byAgent: this.computeByAgent(calls, audits),
       byTool: this.computeByTool(calls),
       timeline: this.computeTimeline(calls, audits, since, generatedAt),
@@ -144,10 +151,7 @@ export class Metrics {
    * `wa_read_messages` foi chamada com sucesso, não quantas mensagens foram
    * de fato devolvidas. Documentado conforme pedido, sem inventar um número.
    */
-  private computeTotals(
-    calls: CallRecord[],
-    audits: AuditEvent[],
-  ): MetricsSummary['totals'] {
+  private computeTotals(calls: CallRecord[], audits: AuditEvent[]): MetricsTotals {
     return {
       calls: calls.length,
       errors: calls.filter((c) => c.status === 'error').length,
@@ -175,6 +179,7 @@ export class Metrics {
         ).length,
         p50Ms: percentile(durations, 50),
         p95Ms: percentile(durations, 95),
+        lastCallAt: agentCalls.length > 0 ? Math.max(...agentCalls.map((c) => c.ts)) : null,
       });
     }
     return result.sort((a, b) => b.calls - a.calls);

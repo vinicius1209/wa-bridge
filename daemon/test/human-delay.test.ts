@@ -330,7 +330,7 @@ function semConsultas(eventos: string[]): string[] {
   return eventos.filter((e) => e !== 'abort?');
 }
 
-test('executePlan: composing na leitura e em cada bubble, paused entre bubbles, available no fim', async (t) => {
+test('executePlan: composing na leitura e em cada bubble, paused entre bubbles, paused no fim', async (t) => {
   const { ids, eventos } = await executar(
     t,
     plano([
@@ -346,7 +346,7 @@ test('executePlan: composing na leitura e em cada bubble, paused entre bubbles, 
     'paused',
     'composing', // digitando o 2º
     'send:Tudo bem?',
-    'available',
+    'paused',
   ]);
 });
 
@@ -372,7 +372,7 @@ test('executePlan: espera longa reemite a presença a cada 8s', async (t) => {
     'paused', // pausa: 16s
     'composing',
     'send:dois',
-    'available',
+    'paused',
   ]);
 });
 
@@ -394,10 +394,10 @@ test('executePlan: shouldAbort é consultado antes de cada bubble', async (t) =>
   }
 });
 
-test('executePlan: abortado antes de começar não envia nada e devolve available', async (t) => {
+test('executePlan: abortado antes de começar não envia nada e devolve paused', async (t) => {
   const { ids, eventos } = await executar(t, plano([{ text: 'um', typeMs: 100, pauseAfterMs: 0 }]), () => true);
   assert.deepEqual(ids, []);
-  assert.deepEqual(semConsultas(eventos), ['available']);
+  assert.deepEqual(semConsultas(eventos), ['paused']);
 });
 
 test('executePlan: abortado durante a leitura não envia nada', async (t) => {
@@ -407,7 +407,7 @@ test('executePlan: abortado durante a leitura não envia nada', async (t) => {
     ({ decorridoMs }) => decorridoMs >= 5000,
   );
   assert.deepEqual(ids, []);
-  assert.deepEqual(semConsultas(eventos), ['composing', 'available']);
+  assert.deepEqual(semConsultas(eventos), ['composing', 'paused']);
 });
 
 test('executePlan: abortado durante a digitação não envia o bubble em curso', async (t) => {
@@ -420,7 +420,7 @@ test('executePlan: abortado durante a digitação não envia o bubble em curso',
     ({ decorridoMs }) => decorridoMs >= 5000,
   );
   assert.deepEqual(ids, []);
-  assert.deepEqual(semConsultas(eventos), ['composing', 'composing', 'available']);
+  assert.deepEqual(semConsultas(eventos), ['composing', 'composing', 'paused']);
 });
 
 test('executePlan: cancelado logo após o 1º bubble (sem pausa) não envia o 2º', async (t) => {
@@ -433,7 +433,7 @@ test('executePlan: cancelado logo após o 1º bubble (sem pausa) não envia o 2�
     ({ enviados }) => enviados >= 1,
   );
   assert.deepEqual(ids, ['id-1']);
-  assert.deepEqual(semConsultas(eventos), ['composing', 'composing', 'send:um', 'available']);
+  assert.deepEqual(semConsultas(eventos), ['composing', 'composing', 'send:um', 'paused']);
 });
 
 test('executePlan: cancelado no meio da pausa para antes do próximo bubble', async (t) => {
@@ -447,6 +447,6 @@ test('executePlan: cancelado no meio da pausa para antes do próximo bubble', as
     ({ decorridoMs }) => decorridoMs >= 1500,
   );
   assert.deepEqual(ids, ['id-1']);
-  assert.deepEqual(semConsultas(eventos), ['composing', 'composing', 'send:um', 'paused', 'available']);
-  assert.equal(eventos.filter((e) => e === 'available').length, 1, 'available só uma vez');
+  assert.deepEqual(semConsultas(eventos), ['composing', 'composing', 'send:um', 'paused', 'paused']);
+  assert.equal(eventos.filter((e) => e === 'paused').length, 2, 'a pausa e o encerramento, nunca available');
 });

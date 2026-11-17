@@ -4,190 +4,289 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>wa-bridge · painel</title>
+<meta name="theme-color" content="#0b0d10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#eef0f3" media="(prefers-color-scheme: light)">
+<!-- "Adicionar à Tela de Início" no iPhone abre o painel em tela cheia, com ícone próprio.
+     A barra de status opaca não cobre o conteúdo, então o layout não precisa de safe area. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="wa-bridge">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
 <link rel="stylesheet" href="style.css">
 <link id="favicon" rel="icon" href="data:,">
 </head>
-<body>
+<body data-state="normal">
 
-<!-- Tela de token: fica oculta via classe "hidden" quando há token salvo -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3M15 8l2 2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></symbol>
+    <symbol id="i-qr" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2h-2zM18 18h2v2h-2zM14 18h2"/></symbol>
+    <symbol id="i-log" viewBox="0 0 24 24"><path d="M5 4h10l4 4v12H5z"/><path d="M9 12h6M9 16h6M9 8h3"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12 20 4l-6 16-3-7z"/></symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="m6.5 6.5 11 11"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-draft" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/></symbol>
+    <symbol id="i-media" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="m4 16 5-5 4 4 2-2 5 5"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1 1"/><path d="M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1-1"/></symbol>
+    <symbol id="i-unlink" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1 1"/><path d="M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1-1"/><path d="M4 4l16 16"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m20 16-4-4-8 8"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24"><path d="M4 4h7l9 9-7 7-9-9z"/><circle cx="8.5" cy="8.5" r="1.5"/></symbol>
+  </defs>
+</svg>
+
+<!-- Login por token: fica oculto quando há token salvo -->
 <div id="auth-screen" class="auth-screen hidden">
   <div class="auth-card">
-    <div class="auth-logo">◈</div>
+    <svg class="brand-mark lg" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="7" cy="16" r="4"/><circle cx="25" cy="16" r="4"/>
+      <path d="M11 16c3-6 7-6 10 0"/><path d="M11 16c3 6 7 6 10 0" opacity=".45"/>
+    </svg>
     <h1>wa-bridge</h1>
-    <p id="auth-account" class="account-pill account-pill-lg hidden"></p>
-    <p class="auth-sub">Painel de métricas — acesso local, protegido por token.</p>
-    <label for="token-input" class="auth-label">Bearer token</label>
+    <p id="auth-account" class="instance hidden"></p>
+    <p class="auth-sub">Painel local, protegido pelo token desta instância.</p>
+    <label for="token-input" class="micro">Bearer token</label>
     <input id="token-input" type="password" autocomplete="off" placeholder="cole o token aqui">
-    <button id="token-submit" class="btn btn-primary">Entrar</button>
-    <p id="auth-error" class="auth-error hidden"></p>
+    <button id="token-submit" class="btn primary">Entrar</button>
+    <p id="auth-error" class="auth-error hidden" role="alert"></p>
     <div class="auth-hint">
-      <p>O token desta instância fica em <code id="auth-token-path">~/.wa-bridge/token</code>, gerado no primeiro boot do daemon.</p>
-      <p>Para ver: <code id="auth-token-cmd">cat ~/.wa-bridge/token</code></p>
-      <p class="auth-hint-muted">Cada número tem o próprio daemon e o próprio token.</p>
-      <p class="auth-hint-muted">Fica salvo só neste navegador (localStorage), nunca saiu daqui.</p>
+      <p>O token fica em <code id="auth-token-path">~/.wa-bridge/token</code>, gerado no primeiro boot.</p>
+      <p>O jeito mais fácil: <code>./wa-bridge open</code> abre o painel já autenticado.</p>
+      <p class="muted-note">Fica salvo só neste navegador. Cada número tem o próprio daemon e o próprio token.</p>
     </div>
   </div>
 </div>
 
-<div id="app" class="app hidden">
-
-  <header class="topbar">
-    <div class="topbar-brand">
-      <span class="brand-mark">◈</span>
-      <span class="brand-name">wa-bridge</span>
-      <span class="brand-sep">/</span>
-      <span class="brand-sub">painel</span>
-      <span id="brand-account" class="account-pill hidden"></span>
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="7" cy="16" r="4"/><circle cx="25" cy="16" r="4"/>
+        <path d="M11 16c3-6 7-6 10 0"/><path d="M11 16c3 6 7 6 10 0" opacity=".45"/>
+      </svg>
+      <span>wa-bridge</span>
+      <span id="brand-account" class="instance hidden" title="Rótulo desta instância (account.json)"></span>
     </div>
 
-    <div class="topbar-controls">
-      <div class="window-select" role="group" aria-label="Janela de tempo">
-        <button data-window="3600000" class="window-btn">1h</button>
-        <button data-window="86400000" class="window-btn is-active">24h</button>
-        <button data-window="604800000" class="window-btn">7d</button>
-        <button data-window="2592000000" class="window-btn">30d</button>
+    <button class="search-trigger" id="open-search" aria-label="Buscar mensagens (atalho ⌘K)">
+      <svg class="ic"><use href="#i-search"/></svg><span class="label">Buscar mensagens e áudios</span><span class="kbd">⌘K</span>
+    </button>
+
+    <div class="spacer"></div>
+
+    <div class="seg-wrap">
+      <div class="seg" role="group" aria-label="Janela de tempo" id="window-seg">
+        <button aria-pressed="false" data-window="3600000">1h</button>
+        <button aria-pressed="true" data-window="86400000">24h</button>
+        <button aria-pressed="false" data-window="604800000">7d</button>
+        <button aria-pressed="false" data-window="2592000000">30d</button>
       </div>
-
-      <button id="pause-toggle" class="btn btn-ghost" aria-pressed="false">
-        <span class="pause-icon">⏸</span><span class="pause-label">pausar</span>
-      </button>
-
-      <span id="refresh-indicator" class="refresh-indicator">atualizado agora</span>
-
-      <button id="change-token" class="btn btn-ghost btn-subtle" title="Trocar token">⚿</button>
     </div>
+
+    <div class="live" id="live" data-paused="false">
+      <span class="lamp" aria-hidden="true"></span><span class="txt" id="updated">conectando</span>
+    </div>
+    <button class="icon-btn" id="pause" aria-label="Pausar atualização" aria-pressed="false"><svg class="ic"><use href="#i-pause"/></svg></button>
+    <button class="icon-btn" id="change-token" aria-label="Trocar token de acesso"><svg class="ic"><use href="#i-key"/></svg></button>
   </header>
 
-  <div id="connection-banner" class="banner banner-error hidden"></div>
+  <div class="banner" role="alert" id="banner">
+    <svg class="ic"><use href="#i-info"/></svg>
+    <strong>Daemon fora do ar.</strong>
+    <span class="grow"><span id="banner-text">Sem resposta.</span> Nova tentativa em <span class="mono" id="retry">10s</span>.</span>
+    <button class="btn sm" id="retry-now"><svg class="ic"><use href="#i-refresh"/></svg>Tentar agora</button>
+  </div>
 
-  <main class="main">
-
-    <!-- Status da sessão -->
-    <section class="session-bar" id="session-bar">
-      <div class="session-state">
-        <span id="session-dot" class="status-dot"></span>
-        <span id="session-state-label" class="session-state-label">—</span>
+  <main>
+    <!-- Sessão: o destaque da página -->
+    <section class="card hero stale" aria-label="Sessão do WhatsApp" id="hero">
+      <div class="hero-state">
+        <span class="micro">Sessão</span>
+        <div class="state-line"><span class="signal" aria-hidden="true"></span><span class="state-name" id="state-name">Carregando</span></div>
+        <div class="who" id="who"></div>
+        <div class="who" id="since"></div>
+        <div class="session-error hidden" id="session-error"></div>
       </div>
-      <div class="session-meta">
-        <span id="session-number" class="session-number">—</span>
-        <span id="session-since" class="session-since"></span>
-      </div>
-      <div id="session-error" class="session-error hidden"></div>
-    </section>
-
-    <section id="qr-pairing" class="qr-pairing hidden">
-      <div class="qr-card">
-        <p class="qr-title">Pareie o WhatsApp</p>
-        <img id="qr-image" alt="QR Code de pareamento do WhatsApp" />
-        <p class="qr-hint">Abra o WhatsApp no celular → Aparelhos conectados → Conectar um aparelho.</p>
-      </div>
-    </section>
-
-    <!-- KPIs -->
-    <section class="kpi-grid" id="kpi-grid" aria-label="Indicadores agregados"></section>
-
-    <!-- Timeline -->
-    <section class="panel" id="panel-timeline">
-      <div class="panel-head">
-        <h2>Timeline</h2>
-        <div class="legend">
-          <span class="legend-item"><i class="legend-swatch sw-calls"></i>chamadas</span>
-          <span class="legend-item"><i class="legend-swatch sw-sends"></i>envios</span>
-          <span class="legend-item"><i class="legend-swatch sw-errors"></i>erros</span>
+      <div class="gauges">
+        <div class="gauge">
+          <span class="micro">Envios na última hora</span>
+          <span class="val"><span id="sent-hour">0</span><small id="sent-limit"> / 10</small></span>
+          <div class="slots" id="slots" aria-hidden="true"></div>
+          <span class="hint" id="sent-hint"></span>
+        </div>
+        <div class="gauge">
+          <span class="micro">Horário de silêncio</span>
+          <span class="val" id="quiet">inativo</span>
+          <span class="hint" id="quiet-hint"></span>
+        </div>
+        <div class="gauge">
+          <span class="micro">Gate de envio</span>
+          <span class="val"><span id="pending-count">0</span><small> aguardando aprovação</small></span>
+          <span class="hint" id="gate-hint"></span>
         </div>
       </div>
-      <div class="panel-body">
-        <div id="timeline-chart" class="chart-wrap"></div>
-        <div id="timeline-empty" class="empty-state hidden">
-          <p>Nenhuma atividade registrada nesta janela.</p>
-          <p class="empty-sub">Quando um agente chamar uma tool do wa-bridge, os buckets de tempo aparecem aqui.</p>
-        </div>
+      <div class="hero-actions">
+        <button class="btn" id="repair"><svg class="ic"><use href="#i-qr"/></svg>Parear de novo</button>
+        <button class="btn" id="show-logs"><svg class="ic"><use href="#i-log"/></svg>Ver logs</button>
       </div>
     </section>
 
-    <div class="two-col">
-      <!-- Por agente -->
-      <section class="panel" id="panel-byagent">
-        <div class="panel-head">
-          <h2>Uso por agente</h2>
-          <span class="panel-sub">quem domina o uso do WhatsApp</span>
-        </div>
-        <div class="panel-body">
-          <div id="byagent-list" class="agent-list"></div>
-          <div id="byagent-empty" class="empty-state hidden">
-            <p>Nenhum agente chamou o wa-bridge ainda nesta janela.</p>
-          </div>
-        </div>
-      </section>
+    <!-- Pareamento: substitui o resto da página -->
+    <section class="card pairing" aria-label="Pareamento">
+      <div class="qr-col">
+        <div class="qr-wrap"><img id="qr-image" alt="QR de pareamento do WhatsApp"></div>
+        <div class="bar" aria-hidden="true"><i id="qr-bar" style="width:100%"></i></div>
+      </div>
+      <div>
+        <span class="micro">Aguardando pareamento</span>
+        <h2>Conecte o seu WhatsApp</h2>
+        <p class="who" id="qr-hint">O QR troca a cada ~20s; o próximo aparece aqui sozinho.</p>
+        <ol class="steps">
+          <li><span>No celular, abra o WhatsApp e vá em <b>Aparelhos conectados</b>.</span></li>
+          <li><span>Toque em <b>Conectar um aparelho</b> e aponte para o QR.</span></li>
+          <li><span>Espere a sincronização: os últimos <b id="history-days">7 dias</b> de conversa entram nos primeiros minutos.</span></li>
+        </ol>
+        <div class="note"><svg class="ic"><use href="#i-info"/></svg><span>O wa-bridge usa uma biblioteca não oficial. Use no seu número, sem disparo em massa: a conta pode ser banida.</span></div>
+      </div>
+    </section>
 
-      <!-- Por tool -->
-      <section class="panel" id="panel-bytool">
-        <div class="panel-head">
-          <h2>Uso por tool</h2>
-          <span class="panel-sub">chamadas, erros e p95</span>
-        </div>
-        <div class="panel-body">
-          <div class="table-scroll">
-            <table class="data-table" id="bytool-table">
-              <thead>
-                <tr><th>tool</th><th class="num">calls</th><th class="num">erros</th><th class="num">p95</th></tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div id="bytool-empty" class="empty-state hidden">
-            <p>Nenhuma tool chamada ainda nesta janela.</p>
-          </div>
-        </div>
-      </section>
-    </div>
+    <!-- Agora -->
+    <section class="card span-4 dash stale" aria-labelledby="h-drafts" id="panel-drafts">
+      <div class="card-head"><h2 id="h-drafts">Aguardando aprovação</h2><span class="sub">rascunhos do gate</span></div>
+      <div class="card-body">
+        <div class="queue has-data" id="drafts"></div>
+        <div class="empty"><p>Nenhum rascunho esperando você.</p><p class="muted-note">Quando um agente preparar um envio, ele aparece aqui até ser aprovado (no agente) ou expirar.</p></div>
+      </div>
+    </section>
 
-    <div class="two-col">
-      <!-- Auditoria -->
-      <section class="panel" id="panel-audit">
-        <div class="panel-head">
-          <h2>Trilha de auditoria</h2>
-          <span class="panel-sub">últimos eventos de envio e sessão</span>
-        </div>
-        <div class="panel-body">
-          <ul id="audit-list" class="audit-list"></ul>
-          <div id="audit-empty" class="empty-state hidden">
-            <p>Nenhum evento de auditoria ainda.</p>
-            <p class="empty-sub">Envios, bloqueios e pareamentos aparecem aqui conforme acontecem.</p>
-          </div>
-        </div>
-      </section>
+    <section class="card span-4 dash stale" aria-labelledby="h-sends" id="panel-sends">
+      <div class="card-head"><h2 id="h-sends">Enviando agora</h2><span class="sub">com digitação simulada</span></div>
+      <div class="card-body">
+        <div class="queue has-data" id="sends"></div>
+        <div class="empty"><p>Nada saindo agora.</p><p class="muted-note">Envio confirmado aparece aqui bolha a bolha, e dá para cancelar até a última sair.</p></div>
+      </div>
+    </section>
 
-      <!-- Últimas chamadas -->
-      <section class="panel" id="panel-calls">
-        <div class="panel-head">
-          <h2>Últimas chamadas</h2>
-          <span class="panel-sub">tool calls recentes, com duração e status</span>
-        </div>
-        <div class="panel-body">
-          <div class="table-scroll">
-            <table class="data-table" id="calls-table">
-              <thead>
-                <tr><th>hora</th><th>agente</th><th>tool</th><th class="num">duração</th><th>status</th></tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div id="calls-empty" class="empty-state hidden">
-            <p>Nenhuma chamada registrada ainda.</p>
-          </div>
-        </div>
-      </section>
-    </div>
+    <section class="card span-4 dash stale" aria-labelledby="h-live" id="panel-live">
+      <div class="card-head"><h2 id="h-live">Ao vivo</h2><span class="sub" id="live-sub">mensagens chegando</span></div>
+      <div class="card-body">
+        <ul class="feed has-data" id="feed" aria-live="polite" aria-relevant="additions"></ul>
+        <div class="empty"><p>Silêncio por aqui.</p><p class="muted-note">Mensagens novas aparecem assim que chegam, pelo stream <span class="mono">/events</span>.</p></div>
+      </div>
+    </section>
 
+    <!-- Indicadores -->
+    <section class="kpis dash stale" aria-label="Indicadores da janela" id="kpis"></section>
+
+    <!-- Atividade -->
+    <section class="card span-12 dash stale" aria-labelledby="h-time" id="panel-chart">
+      <div class="card-head">
+        <h2 id="h-time">Atividade</h2><span class="sub" id="chart-sub">últimas 24h, por hora</span>
+        <div class="end legend">
+          <span><i class="lg-calls"></i>chamadas</span>
+          <span><i class="lg-err"></i>com erro</span>
+          <span><i class="lg-send"></i>envios</span>
+          <span id="legend-limit"><i class="lg-limit"></i>limite por hora</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="chart has-data" id="chart"></div>
+        <div class="empty"><p>Nenhuma atividade nesta janela.</p><p class="muted-note">Plugue o MCP no seu agente: <span class="mono">./wa-bridge mcp-config</span></p></div>
+      </div>
+    </section>
+
+    <!-- Agentes e tools -->
+    <section class="card span-5 dash stale" aria-labelledby="h-agents" id="panel-agents">
+      <div class="card-head"><h2 id="h-agents">Agentes</h2><span class="sub">o painel não entra na conta</span></div>
+      <div class="card-body">
+        <div class="agents has-data" id="agents"></div>
+        <div class="empty"><p>Nenhum agente chamou o wa-bridge nesta janela.</p></div>
+      </div>
+    </section>
+
+    <section class="card span-7 dash stale" aria-labelledby="h-tools" id="panel-tools">
+      <div class="card-head"><h2 id="h-tools">Tools</h2><span class="sub">chamadas, erros e p95</span></div>
+      <div class="card-body">
+        <div class="table-scroll has-data">
+          <table id="tools"><thead><tr><th scope="col">tool</th><th scope="col">uso</th><th scope="col" class="r">calls</th><th scope="col" class="r">erros</th><th scope="col" class="r">p95</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="empty"><p>Nenhuma tool chamada nesta janela.</p></div>
+      </div>
+    </section>
+
+    <!-- Auditoria e chamadas -->
+    <section class="card span-5 dash stale" aria-labelledby="h-audit" id="panel-audit">
+      <div class="card-head"><h2 id="h-audit">Auditoria</h2><span class="sub">envios, bloqueios e sessão</span><button class="link end" id="audit-more" aria-expanded="false">ver mais</button></div>
+      <div class="card-body">
+        <ul class="audit has-data" id="audit"></ul>
+        <div class="empty"><p>Nenhum evento ainda.</p><p class="muted-note">Envios, bloqueios e pareamentos aparecem aqui conforme acontecem.</p></div>
+      </div>
+    </section>
+
+    <section class="card span-7 dash stale" aria-labelledby="h-calls" id="panel-calls">
+      <div class="card-head"><h2 id="h-calls">Chamadas recentes</h2><span class="sub">clique num erro para ver o detalhe</span><button class="link end" id="calls-more" aria-expanded="false">ver as 100</button></div>
+      <div class="card-body">
+        <div class="table-scroll has-data">
+          <table id="calls"><thead><tr><th scope="col">hora</th><th scope="col">agente</th><th scope="col">tool</th><th scope="col" class="r">duração</th><th scope="col">status</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="empty"><p>Nenhuma chamada registrada.</p></div>
+      </div>
+    </section>
+
+    <!-- Saúde -->
+    <section class="card span-12 dash stale" aria-labelledby="h-health" id="panel-health">
+      <div class="card-head"><h2 id="h-health">Saúde da instalação</h2><span class="sub">o que antes só aparecia no terminal</span></div>
+      <div class="health" id="health"></div>
+    </section>
   </main>
 
-  <footer class="footer">
-    <span>wa-bridge dashboard · dados locais, sem telemetria</span>
-    <span id="mock-badge" class="mock-badge hidden">modo mock</span>
+  <footer>
+    <span>wa-bridge · dados locais, sem telemetria</span>
+    <span class="mono" id="footer-version"></span>
+    <span id="mock-badge" class="chip warn hidden">modo mock</span>
   </footer>
-
 </div>
+
+<!-- Busca -->
+<div class="palette-backdrop" id="palette" aria-hidden="true">
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Buscar mensagens">
+    <label class="palette-input"><svg class="ic"><use href="#i-search"/></svg>
+      <span class="sr-only">Buscar</span>
+      <input id="q" placeholder="Buscar em todas as conversas e transcrições" autocomplete="off">
+      <span class="kbd">esc</span>
+    </label>
+    <ul class="results" id="results" role="listbox" aria-label="Resultados"></ul>
+    <div class="palette-foot"><span>↑↓ navegar</span><span>esc fecha</span><span>ignora acentos · <span class="mono">termo*</span> busca prefixo · áudio só depois de transcrito</span></div>
+  </div>
+</div>
+
+<dialog id="confirm-repair">
+  <h3>Parear de novo?</h3>
+  <p>Este aparelho sai de <b>Aparelhos conectados</b> no celular, a sessão é descartada e um QR novo aparece aqui.</p>
+  <p>Vale a pena para importar o histórico recente. Enquanto você não escanear, nenhum agente lê ou envia.</p>
+  <div class="actions"><button class="btn" id="repair-cancel">Cancelar</button><button class="btn primary" id="repair-ok">Descartar sessão e gerar QR</button></div>
+</dialog>
+
+<dialog id="logs-dialog">
+  <h3>Logs do daemon</h3>
+  <p>O painel não lê arquivos do disco. No terminal, na pasta do wa-bridge:</p>
+  <p><code id="logs-cmd">./wa-bridge logs</code></p>
+  <p class="muted-note">Para seguir uma chamada específica, use o traceId do detalhe em "Chamadas recentes".</p>
+  <div class="actions"><button class="btn" id="logs-copy"><svg class="ic"><use href="#i-copy"/></svg>Copiar comando</button><button class="btn primary" id="logs-close">Fechar</button></div>
+</dialog>
+
+<div class="toast" id="toast" role="status"></div>
 
 <script src="mock-data.js"></script>
 <script src="app.js"></script>

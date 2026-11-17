@@ -4,6 +4,7 @@
  */
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { maskNumber } from '../config.js';
+import { DEVICE_SYNC_PROTOCOL_TYPES, MEDIA_COPY_ASSOCIATION_TYPES } from '../whatsapp/protocol.js';
 import type {
   AuditAction,
   AuditEvent,
@@ -17,9 +18,12 @@ import type {
   GroupParticipantMatch,
   MatchReason,
   MediaArtifact,
+  MediaFiles,
   MediaKind,
   MediaState,
   MessageType,
+  SearchHit,
+  SearchSource,
   StoredMessage,
 } from '../types.js';
 
@@ -48,6 +52,8 @@ export interface SendRecord {
   bubblesSent: number | null;
   cancelled: boolean;
   messageIdsJson: string | null;
+  /** Primeira mensagem para quem nunca conversou com o usuário: conta no limite diário. */
+  firstContact: boolean;
 }
 
 /** Linha bruta de `messages`, antes da conversão de inteiros para boolean. */
@@ -147,6 +153,7 @@ interface SendRow {
   bubbles_sent: number | null;
   cancelled: number;
   message_ids_json: string | null;
+  first_contact: number;
 }
 
 interface AuditRow {
@@ -189,6 +196,8 @@ function onlyDigits(s: string): string {
 function mediaStateFor(error: string | null): MediaState {
   if (error === null) return 'ready';
   if (error.startsWith('MEDIA_EXPIRED')) return 'expired';
+  // Arquivo apagado pela retenção: some do disco, mas `wa_media` ainda pode baixar de novo.
+  if (error.startsWith('PRUNED')) return 'pending';
   // Falhas "leves" (whisper/ffmpeg) deixam o arquivo baixado e utilizável.
   if (error.startsWith('WHISPER_') || error.startsWith('FFMPEG_')) return 'ready';
   return 'failed';
@@ -263,17 +272,36 @@ function rowToGroupParticipant(row: GroupParticipantRow): GroupParticipant {
   };
 }
 
+/** Lê `frames_json` tolerando conteúdo ausente ou corrompido. */
+function parseFramePaths(framesJson: string | null): string[] {
+  if (!framesJson) return [];
+  try {
+    const parsed = JSON.parse(framesJson) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Converte texto livre numa query FTS5 que nunca dá erro de sintaxe: cada termo vira
+ * uma frase entre aspas (todos obrigatórios) e `termo*` vira busca por prefixo. Sem
+ * isto, um `"`, `:`, `-` ou `NEAR` digitado pelo agente quebraria o MATCH.
+ */
+export function toFtsQuery(input: string): string | null {
+  const terms: string[] = [];
+  for (const raw of input.split(/\s+/)) {
+    const prefix = raw.endsWith('*');
+    const core = raw.replace(/\*+$/, '').replace(/"/g, '').trim();
+    if (core.length === 0) continue;
+    terms.push(prefix ? `"${core}"*` : `"${core}"`);
+  }
+  return terms.length > 0 ? terms.join(' ') : null;
+}
+
 /** Converte linha de `media` no tipo `MediaArtifact`. */
 function rowToMedia(row: MediaRow): MediaArtifact {
-  let framePaths: string[] = [];
-  if (row.frames_json) {
-    try {
-      const parsed = JSON.parse(row.frames_json) as unknown;
-      if (Array.isArray(parsed)) framePaths = parsed.filter((p): p is string => typeof p === 'string');
-    } catch {
-      framePaths = [];
-    }
-  }
+  const framePaths = parseFramePaths(row.frames_json);
   return {
     messageId: row.message_id,
     kind: row.kind as MediaKind,
@@ -316,6 +344,7 @@ function rowToSend(row: SendRow): SendRecord {
     bubblesSent: row.bubbles_sent,
     cancelled: row.cancelled === 1,
     messageIdsJson: row.message_ids_json,
+    firstContact: row.first_contact === 1,
   };
 }
 
@@ -379,8 +408,44 @@ export class Store {
     return stmt;
   }
 
-  /** Cria o schema (idempotente) se as tabelas ainda não existirem. */
+  /**
+   * Evolui o schema por versão (`PRAGMA user_version`). Cada passo roda uma única vez,
+   * em ordem e em transação, e grava a versão nova junto. Bancos criados antes do
+   * versionamento estão na versão 0: o passo 1 é idempotente e só confirma o que existe.
+   * Schema novo = passo novo no fim da lista; nunca edite um passo que já foi publicado.
+   */
   migrate(): void {
+    const steps: Array<() => void> = [
+      () => this.migrateBaseSchema(),
+      () => this.migrateSearchIndex(),
+      () => this.migrateDropDeviceSyncMessages(),
+      () => this.migrateSendFirstContact(),
+      () => this.migrateDropRedundantMessages(),
+    ];
+    const row = this.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number };
+    for (let target = Number(row.user_version) + 1; target <= steps.length; target += 1) {
+      const step = steps[target - 1];
+      if (!step) break;
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        step();
+        this.db.exec(`PRAGMA user_version = ${target}`);
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    }
+  }
+
+  /** Versão do schema gravada no banco (`PRAGMA user_version`). */
+  schemaVersion(): number {
+    const row = this.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number };
+    return Number(row.user_version);
+  }
+
+  /** Passo 1: schema original (tabelas, índices e a coluna `contacts.phone_jid`). */
+  private migrateBaseSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chats (
         jid TEXT PRIMARY KEY, name TEXT, is_group INTEGER NOT NULL DEFAULT 0,
@@ -434,6 +499,119 @@ export class Store {
     `);
 
     this.addColumnIfMissing('contacts', 'phone_jid', 'TEXT');
+  }
+
+  /**
+   * Passo 2: índice de busca textual (FTS5) sobre `messages.text` e `media.transcript`.
+   *
+   * As duas tabelas FTS são de conteúdo externo (só o índice, sem duplicar o texto) e
+   * ficam em sincronia por trigger, então nenhum caminho de escrita precisa lembrar dela.
+   * `remove_diacritics` faz "reuniao" achar "Reunião". Elas dependem do `rowid` implícito
+   * de `messages`/`media`: um `VACUUM` manual pode renumerá-lo, e aí é preciso rodar
+   * `rebuild` (ver docs/OPERACAO.md). O código nunca roda VACUUM.
+   */
+  private migrateSearchIndex(): void {
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        text, content='messages', content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2');
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF text ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+        INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
+      END;
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
+        transcript, content='media', content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2');
+      CREATE TRIGGER IF NOT EXISTS media_fts_ai AFTER INSERT ON media BEGIN
+        INSERT INTO media_fts(rowid, transcript) VALUES (new.rowid, new.transcript);
+      END;
+      CREATE TRIGGER IF NOT EXISTS media_fts_ad AFTER DELETE ON media BEGIN
+        INSERT INTO media_fts(media_fts, rowid, transcript) VALUES ('delete', old.rowid, old.transcript);
+      END;
+      CREATE TRIGGER IF NOT EXISTS media_fts_au AFTER UPDATE OF transcript ON media BEGIN
+        INSERT INTO media_fts(media_fts, rowid, transcript) VALUES ('delete', old.rowid, old.transcript);
+        INSERT INTO media_fts(rowid, transcript) VALUES (new.rowid, new.transcript);
+      END;
+
+      INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
+      INSERT INTO media_fts(media_fts) VALUES ('rebuild');
+    `);
+  }
+
+  /**
+   * Passo 3: apaga as mensagens de sincronização entre aparelhos (`protocolMessage` de
+   * histórico, chaves e configurações) que versões anteriores gravavam como `unknown` na
+   * conversa do usuário com ele mesmo. O `raw_json` guarda o tipo pelo nome; o número
+   * cobre gravações sem essa conversão. `raw_json` inválido fica como está.
+   *
+   * Essa conversa só aparecia na lista por causa delas: se fica sem mensagem, sai de
+   * `chats`; se ainda tem outras, a última atividade volta a ser a dessas.
+   */
+  private migrateDropDeviceSyncMessages(): void {
+    const types: Array<string | number> = [
+      ...Object.keys(DEVICE_SYNC_PROTOCOL_TYPES),
+      ...Object.values(DEVICE_SYNC_PROTOCOL_TYPES),
+    ];
+    const match = `type = 'unknown'
+      AND CASE WHEN json_valid(raw_json)
+               THEN json_extract(raw_json, '$.message.protocolMessage.type') END
+          IN (${types.map(() => '?').join(', ')})`;
+    const chats = this.db
+      .prepare(`SELECT DISTINCT chat_jid AS jid FROM messages WHERE ${match}`)
+      .all(...types) as unknown as Array<{ jid: string }>;
+    this.db.prepare(`DELETE FROM messages WHERE ${match}`).run(...types);
+
+    const dropEmpty = this.db.prepare(
+      'DELETE FROM chats WHERE jid = ? AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_jid = ?)',
+    );
+    const refresh = this.db.prepare(
+      'UPDATE chats SET last_message_at = (SELECT MAX(ts) FROM messages WHERE chat_jid = ?) WHERE jid = ?',
+    );
+    for (const { jid } of chats) {
+      dropEmpty.run(jid, jid);
+      refresh.run(jid, jid);
+    }
+  }
+
+  /** Passo 4: `sends.first_contact`, que o limite diário de conversas novas conta. */
+  private migrateSendFirstContact(): void {
+    const columns = this.db.prepare('PRAGMA table_info(sends)').all() as unknown as Array<{ name: string }>;
+    if (columns.some((c) => c.name === 'first_contact')) return;
+    this.db.exec('ALTER TABLE sends ADD COLUMN first_contact INTEGER NOT NULL DEFAULT 0');
+  }
+
+  /**
+   * Passo 5: apaga os cabeçalhos de álbum (`albumMessage`) e as cópias de mídia
+   * (`associatedChildMessage` de versão HD ou foto com movimento) que versões anteriores
+   * gravavam como `unknown`. A foto ou o vídeo de verdade de cada uma já está no banco como
+   * mensagem própria. `raw_json` inválido fica como está.
+   */
+  private migrateDropRedundantMessages(): void {
+    const copies: Array<string | number> = [
+      ...Object.keys(MEDIA_COPY_ASSOCIATION_TYPES),
+      ...Object.values(MEDIA_COPY_ASSOCIATION_TYPES),
+    ];
+    this.db
+      .prepare(
+        `DELETE FROM messages
+          WHERE type = 'unknown'
+            AND CASE WHEN json_valid(raw_json) THEN
+                  json_type(raw_json, '$.message.albumMessage') IS NOT NULL
+                  OR (json_type(raw_json, '$.message.associatedChildMessage') IS NOT NULL
+                      AND json_extract(raw_json, '$.message.messageContextInfo.messageAssociation.associationType')
+                          IN (${copies.map(() => '?').join(', ')}))
+                ELSE 0 END`,
+      )
+      .run(...copies);
   }
 
   /** Fecha o banco. Depois disto nenhum método do Store funciona. */
@@ -520,6 +698,47 @@ export class Store {
   }
 
   /**
+   * Busca textual (FTS5) no texto das mensagens e nas transcrições de áudio/vídeo, mais
+   * recentes primeiro. Transcrição só existe para mídia já processada por `wa_media`.
+   * Não devolve telefone cru: o resultado vai direto para o agente via MCP.
+   */
+  searchMessages(opts: { query: string; chatJid?: string; since?: number; limit: number }): SearchHit[] {
+    const fts = toFtsQuery(opts.query);
+    if (!fts) return [];
+    const rows = this.prepare(
+      `WITH hits AS (
+         SELECT m.id AS message_id, 'text' AS source,
+                snippet(messages_fts, 0, '«', '»', '…', 12) AS snippet
+           FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
+          WHERE messages_fts MATCH ?1
+         UNION ALL
+         SELECT md.message_id, 'transcript',
+                snippet(media_fts, 0, '«', '»', '…', 12)
+           FROM media_fts JOIN media md ON md.rowid = media_fts.rowid
+          WHERE media_fts MATCH ?1)
+       SELECT h.source AS hit_source, h.snippet AS hit_snippet,
+              m.id, m.chat_jid, m.sender_jid, m.sender_name, m.from_me, m.ts, m.type,
+              m.text, m.caption, m.view_once, m.quoted_text, m.has_media, m.media_state,
+              NULL AS raw_json, COALESCE(c.name, ct.push_name) AS chat_name
+         FROM hits h
+         JOIN messages m ON m.id = h.message_id
+         LEFT JOIN chats c ON c.jid = m.chat_jid
+         LEFT JOIN contacts ct ON ct.jid = m.chat_jid
+        WHERE (?2 IS NULL OR m.chat_jid = ?2) AND (?3 IS NULL OR m.ts >= ?3)
+        ORDER BY m.ts DESC
+        LIMIT ?4`,
+    ).all(fts, opts.chatJid ?? null, opts.since ?? null, opts.limit) as unknown as Array<
+      MessageRow & { hit_source: SearchSource; hit_snippet: string | null; chat_name: string | null }
+    >;
+    return rows.map((row) => ({
+      message: rowToMessage(row),
+      chatName: row.chat_name,
+      source: row.hit_source,
+      snippet: row.hit_snippet ?? '',
+    }));
+  }
+
+  /**
    * Lista mensagens de uma conversa, mais recentes primeiro, com corte opcional por `since`.
    * Cada mensagem traz `senderPhoneJid`: o telefone real quando o remetente é LID e o
    * número é conhecido (`contacts.phone_jid`), senão `null`.
@@ -566,6 +785,17 @@ export class Store {
          last_message_at = MAX(COALESCE(chats.last_message_at, 0), COALESCE(excluded.last_message_at, 0)),
          unread_count = chats.unread_count + excluded.unread_count`,
     ).run(c.jid, c.name, c.isGroup ? 1 : 0, c.lastMessageAt, c.unreadCount);
+  }
+
+  /** Nome de exibição de uma conversa (nome do grupo ou do contato), ou `null`. */
+  getChatName(jid: string): string | null {
+    const row = this.prepare(
+      `SELECT COALESCE(c.name, ct.push_name) AS name
+         FROM (SELECT ? AS jid) q
+         LEFT JOIN chats c ON c.jid = q.jid
+         LEFT JOIN contacts ct ON ct.jid = q.jid`,
+    ).get(jid) as unknown as { name: string | null } | undefined;
+    return row?.name ?? null;
   }
 
   /**
@@ -1039,14 +1269,22 @@ export class Store {
     return row ? rowToDraft(row) : null;
   }
 
+  /** Rascunhos ainda pendentes e não expirados, mais antigos primeiro (para o painel). */
+  listPendingDrafts(now: number): DraftRecord[] {
+    const rows = this.prepare(
+      `SELECT * FROM drafts WHERE status = 'pending' AND expires_at > ? ORDER BY created_at`,
+    ).all(now) as unknown as DraftRow[];
+    return rows.map(rowToDraft);
+  }
+
   // ------------------------------------------------------------------ sends
 
   /** Registra o início de um envio (plano de delay humano). */
   insertSend(s: SendRecord): void {
     this.prepare(
       `INSERT INTO sends (send_id, chat_jid, agent, trace_id, started_at, finished_at,
-         stage, bubbles_total, bubbles_sent, cancelled, message_ids_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         stage, bubbles_total, bubbles_sent, cancelled, message_ids_json, first_contact)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       s.sendId,
       s.chatJid,
@@ -1059,6 +1297,7 @@ export class Store {
       s.bubblesSent,
       s.cancelled ? 1 : 0,
       s.messageIdsJson,
+      s.firstContact ? 1 : 0,
     );
   }
 
@@ -1105,6 +1344,22 @@ export class Store {
     return row.n;
   }
 
+  /** Envios de primeiro contato (`first_contact`) desde `since`. */
+  countFirstContactSendsSince(since: number): number {
+    const row = this.prepare('SELECT COUNT(*) AS n FROM sends WHERE started_at >= ? AND first_contact = 1').get(
+      since,
+    ) as unknown as { n: number };
+    return row.n;
+  }
+
+  /** Início do envio mais recente para a conversa, ou `null` se nunca houve. */
+  lastSendToChatAt(chatJid: string): number | null {
+    const row = this.prepare('SELECT MAX(started_at) AS ts FROM sends WHERE chat_jid = ?').get(chatJid) as unknown as {
+      ts: number | null;
+    };
+    return row.ts ?? null;
+  }
+
   // ------------------------------------------------------------------ audit
 
   /** Insere um evento de auditoria. Append-only: nunca é alterado ou removido. */
@@ -1127,6 +1382,66 @@ export class Store {
       since,
     ) as unknown as AuditRow[];
     return rows.map(rowToAudit);
+  }
+
+  // --------------------------------------------------------------- retenção
+
+  /**
+   * Apaga as mensagens anteriores a `before` e a mídia delas (o índice de busca sai junto,
+   * por trigger). Devolve os arquivos que estavam em disco, para quem chama removê-los.
+   */
+  deleteMessagesBefore(before: number): { deleted: number; files: MediaFiles[] } {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.prepare(
+        `SELECT md.message_id, md.path, md.frames_json
+           FROM media md JOIN messages m ON m.id = md.message_id
+          WHERE m.ts < ?`,
+      ).all(before) as unknown as Array<{ message_id: string; path: string | null; frames_json: string | null }>;
+      this.prepare('DELETE FROM media WHERE message_id IN (SELECT id FROM messages WHERE ts < ?)').run(before);
+      const result = this.prepare('DELETE FROM messages WHERE ts < ?').run(before);
+      this.db.exec('COMMIT');
+      return {
+        deleted: Number(result.changes),
+        files: rows.map((r) => ({ messageId: r.message_id, path: r.path ?? '', framePaths: parseFramePaths(r.frames_json) })),
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** Mídias com arquivo em disco processadas antes de `before`: candidatas à retenção. */
+  mediaFilesProcessedBefore(before: number, limit: number): MediaFiles[] {
+    const rows = this.prepare(
+      `SELECT message_id, path, frames_json FROM media
+        WHERE path IS NOT NULL AND path != '' AND processed_at < ?
+        ORDER BY processed_at LIMIT ?`,
+    ).all(before, limit) as unknown as Array<{ message_id: string; path: string; frames_json: string | null }>;
+    return rows.map((r) => ({ messageId: r.message_id, path: r.path, framePaths: parseFramePaths(r.frames_json) }));
+  }
+
+  /**
+   * Marca a mídia como podada: o arquivo saiu do disco, a transcrição fica (e continua
+   * buscável). `messages.media_state` volta a `pending`, porque `wa_media` ainda pode
+   * baixar de novo enquanto o WhatsApp tiver o arquivo.
+   */
+  markMediaPruned(messageId: string): void {
+    this.prepare(
+      `UPDATE media SET path = '', bytes = 0, frames_json = '[]', error = 'PRUNED'
+        WHERE message_id = ?`,
+    ).run(messageId);
+    this.prepare('UPDATE messages SET media_state = ? WHERE id = ?').run(mediaStateFor('PRUNED'), messageId);
+  }
+
+  /** Apaga registros de chamada anteriores a `before`; devolve quantos saíram. */
+  deleteCallsBefore(before: number): number {
+    return Number(this.prepare('DELETE FROM metrics_calls WHERE ts < ?').run(before).changes);
+  }
+
+  /** Apaga rascunhos que expiraram antes de `before` (o payload guarda o texto); devolve quantos. */
+  deleteDraftsExpiredBefore(before: number): number {
+    return Number(this.prepare('DELETE FROM drafts WHERE expires_at < ?').run(before).changes);
   }
 
   // ---------------------------------------------------------------- métricas

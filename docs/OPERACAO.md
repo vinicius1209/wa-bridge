@@ -1,7 +1,7 @@
 # Operação
 
 O caminho padrão é o script `./wa-bridge` (`setup`, `start`, `stop`, `status`, `logs`,
-`service`, `open`, `qr`, `pair`, `mcp-config`, `doctor`). Este documento cobre o resto: rodar como
+`service`, `events`, `open`, `qr`, `pair`, `mcp-config`, `doctor`). Este documento cobre o resto: rodar como
 serviço (launchd/systemd), Docker, pareamento, troubleshooting, backup e reset.
 
 > **Script nativo, serviço e Docker são formas EXCLUDENTES de rodar o wa-bridge, nunca
@@ -218,7 +218,9 @@ journalctl --user -u wa-bridge -f                 # o log principal fica em ~/.w
 
 O caminho normal: `./wa-bridge start`, depois `./wa-bridge open` (painel já autenticado,
 com o QR) ou `./wa-bridge qr` (salva o QR como PNG e abre). No celular: WhatsApp >
-Aparelhos conectados > Conectar aparelho.
+Aparelhos conectados > Conectar aparelho. Na lista, o daemon aparece como
+**Google Chrome (wa-bridge)**, separado do WhatsApp Web; o nome vem de `WA_DEVICE_NAME` e
+o celular só o lê no pareamento.
 
 Causas mais comuns de falha de pareamento, em ordem de probabilidade:
 
@@ -236,7 +238,8 @@ Causas mais comuns de falha de pareamento, em ordem de probabilidade:
 4. **Credencial morta.** Depois de um logout no próprio celular, ou de ban, a pasta
    `auth/` fica com credenciais que nunca mais vão autenticar. O sintoma é reconectar
    em loop sem nunca abrir, ou `whatsapp: close` com "sessão deslogada". Solução:
-   `./wa-bridge pair` (faz backup de `auth/`, descarta a sessão e gera um QR novo).
+   `./wa-bridge pair` (desvincula o aparelho no celular, descarta a sessão e gera um QR
+   novo).
 5. **`device_removed` com a sessão recém-pareada.** Normalmente significa duas sessões
    Baileys concorrentes na mesma conta — confirme que só existe **um** processo do
    daemon rodando (`ps aux | grep index.js`, ou cheque se o serviço launchd/systemd e o
@@ -244,12 +247,14 @@ Causas mais comuns de falha de pareamento, em ordem de probabilidade:
 
 ### Versão do Baileys
 
-Pinada em **`6.7.24`** (tag `legacy`) de propósito. A tag `latest` do pacote é um
-`7.0.0-rc` — não deve ser usada sem validar o pareamento manualmente primeiro, porque
-RCs de protocolo WhatsApp costumam introduzir quebras de pareamento sem aviso. Se o
-pareamento começar a falhar depois de uma atualização do WhatsApp (app ou protocolo), a
-**primeira coisa a testar** é subir a versão do Baileys (checando o changelog da tag
-antes de trocar), não reescrever a lógica de conexão.
+Pinada em **`7.0.0-rc14`**, versão exata. Ela ainda é um RC, mas trouxe o que a 6.7.24
+não tinha: reenvio automático de mensagem que não decifrou, leitura do histórico embutido
+no pareamento e o mapeamento LID -> telefone. Uma sessão pareada na 6.7.24 continua
+valendo na 7. Antes de trocar de versão, faça backup de `auth/` e do banco, e confira no
+log que a sessão abre e as mensagens chegam. Se o pareamento começar a falhar depois de
+uma atualização do WhatsApp (app ou protocolo), a **primeira coisa a testar** é subir a
+versão do Baileys (checando o changelog da tag antes de trocar), não reescrever a lógica
+de conexão.
 
 ## Onde olhar quando algo falha
 
@@ -271,7 +276,65 @@ antes de trocar), não reescrever a lógica de conexão.
   sqlite3 ~/.wa-bridge/wa.db "SELECT ts, agent, action, chat_jid, outcome FROM audit ORDER BY ts DESC LIMIT 20;"
   ```
 
+## Histórico, retenção e busca
+
+- **Histórico**: no pareamento o celular manda o histórico recente uma única vez; o
+  daemon guarda os últimos `WA_HISTORY_DAYS` dias (padrão 7). Numa sessão que já estava
+  pareada antes desta versão, o histórico só vem pareando de novo (`./wa-bridge pair`).
+  Mensagens que chegam com o daemon parado entram sozinhas quando ele volta.
+- **Retenção** (no boot e a cada 6h): arquivos de mídia saem do disco depois de
+  `WA_RETENTION_MEDIA_DAYS` (30), mantendo a transcrição no banco; métricas de chamada e
+  rascunhos vencidos depois de `WA_RETENTION_METRICS_DAYS` (30). Apagar mensagens vem
+  desligado: para guardar só o último ano, ponha `WA_RETENTION_MESSAGES_DAYS=365` no
+  `.env`. `0` desliga cada item. A auditoria nunca é apagada.
+- **Busca** (`wa_search`, `GET /search`): índice FTS5 mantido por trigger. O código nunca
+  roda `VACUUM`; se você rodar à mão, reconstrua o índice com o daemon parado:
+  ```bash
+  sqlite3 ~/.wa-bridge/wa.db "INSERT INTO messages_fts(messages_fts) VALUES('rebuild'); INSERT INTO media_fts(media_fts) VALUES('rebuild');"
+  ```
+- **Versão do schema**: `sqlite3 ~/.wa-bridge/wa.db "PRAGMA user_version;"`. O daemon
+  migra sozinho no boot; faça um backup antes de atualizar (abaixo).
+
+## Stream de mensagens novas (`GET /events`)
+
+```bash
+./wa-bridge events                 # mensagens de outras pessoas, em tempo real
+./wa-bridge events --from-me       # inclui as enviadas pelo próprio número
+./wa-bridge events --chat <jid>    # só uma conversa
+```
+
+É Server-Sent Events: `event: ready` na conexão, `event: message` com
+`{ message, chatName }` a cada mensagem nova (ao vivo ou da fila offline; histórico
+importado não entra) e `: ping` a cada 25s. Exige o token, como todo dado; o comando
+acima o envia sozinho, por stdin, para ele não aparecer no `ps`. O conteúdo é texto de
+terceiros: qualquer consumidor deve tratá-lo como dado, nunca como instrução.
+
+## Painel no celular
+
+O daemon só escuta em `127.0.0.1`, e deve continuar assim: escutar em `0.0.0.0` abriria
+a API no Wi-Fi em que a máquina estiver. Para abrir o painel em outro aparelho, use uma
+VPN privada que repasse a porta local. Com o Tailscale:
+
+```bash
+tailscale serve --bg --https=8443 http://127.0.0.1:7788   # só na tailnet, com HTTPS
+tailscale serve status                                     # confira "(tailnet only)"
+tailscale serve --https=8443 off                           # desliga
+```
+
+Use uma porta só para o painel: ele monta os endereços da API a partir da raiz, então não
+funciona montado num caminho (`--set-path`). Nunca use `tailscale funnel`, que publica na
+internet. O painel continua pedindo o token na primeira vez em cada navegador.
+
+No iPhone, abra `https://<máquina>.<tailnet>.ts.net:8443/dashboard/` no Safari e use
+Compartilhar → "Adicionar à Tela de Início": o painel abre em tela cheia, com ícone
+próprio. O app da Tela de Início guarda o login separado do Safari, então o token é colado
+de novo ali dentro (`./wa-bridge token` copia; a área de transferência compartilhada da
+Apple leva até o iPhone).
+
 ## Backup e reset
+
+- **Backup consistente do banco** (funciona com o daemon rodando):
+  `sqlite3 ~/.wa-bridge/wa.db ".backup $HOME/.wa-bridge/wa.db.bak"`.
 
 - **Seguro de apagar, sem perder nada essencial**: `~/.wa-bridge/media/` (mídia é
   rematerializável a partir da mensagem original, enquanto ela ainda existir nos

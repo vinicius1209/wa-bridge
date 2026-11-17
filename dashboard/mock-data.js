@@ -1,245 +1,317 @@
 /**
- * Dados de exemplo para o modo mock do painel (?mock=1, ?mock=empty, ?mock=error).
- * Usado só para desenvolvimento local sem o daemon rodando — nunca é usado em produção
- * a menos que o parâmetro esteja presente na URL. Nenhum dado real aqui.
+ * Dados de exemplo do modo mock do painel (?mock=1, ?mock=empty, ?mock=error,
+ * ?mock=pairing, ?mock=close). Só entra em cena com o parâmetro na URL, e nada aqui é
+ * dado real: nomes e números são fictícios.
  */
 (function () {
   'use strict';
 
   var NOW = Date.now();
+  var MIN = 60000;
+  var HOUR = 3600000;
+  var DAY = 86400000;
+  var qs = new URLSearchParams(location.search);
 
-  /** QR "falso" só para exercitar a tela de pareamento — não é um QR válido de verdade. */
-  function fakeQrDataUrl() {
-    var size = 21;
-    var cell = 10;
-    var px = size * cell;
+  var seed = 7;
+  function rnd() {
+    seed = (seed * 9301 + 49297) % 233280;
+    return seed / 233280;
+  }
+  function pick(list) { return list[Math.floor(rnd() * list.length)]; }
+
+  /** QR falso, só para exercitar a tela de pareamento (não pareia nada). */
+  function fakeQrDataUrl(variant) {
+    var size = 29;
     var rects = '';
-    var seed = 42;
-    function rnd() {
-      seed = (seed * 9301 + 49297) % 233280;
-      return seed / 233280;
+    var s = 11 + variant;
+    function r() { s = (s * 9301 + 49297) % 233280; return s / 233280; }
+    function finder(x, y) {
+      rects += '<rect x="' + x + '" y="' + y + '" width="7" height="7" fill="#000"/>' +
+        '<rect x="' + (x + 1) + '" y="' + (y + 1) + '" width="5" height="5" fill="#fff"/>' +
+        '<rect x="' + (x + 2) + '" y="' + (y + 2) + '" width="3" height="3" fill="#000"/>';
     }
     for (var y = 0; y < size; y++) {
       for (var x = 0; x < size; x++) {
-        var onBorder = x < 3 || y < 3 || (x > size - 4 && y < 3) || (x < 3 && y > size - 4);
-        var on = onBorder ? (x + y) % 2 === 0 : rnd() > 0.55;
-        if (on) {
-          rects += '<rect x="' + x * cell + '" y="' + y * cell + '" width="' + cell + '" height="' + cell + '" fill="#111"/>';
-        }
+        var inFinder = (x < 8 && y < 8) || (x > size - 9 && y < 8) || (x < 8 && y > size - 9);
+        if (!inFinder && r() > 0.52) rects += '<rect x="' + x + '" y="' + y + '" width="1" height="1" fill="#000"/>';
       }
     }
-    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + px + '" height="' + px + '">' +
-      '<rect width="' + px + '" height="' + px + '" fill="#fff"/>' + rects + '</svg>';
+    finder(0, 0); finder(size - 7, 0); finder(0, size - 7);
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + size + ' ' + size + '" shape-rendering="crispEdges">' +
+      '<rect width="' + size + '" height="' + size + '" fill="#fff"/>' + rects + '</svg>';
     return 'data:image/svg+xml;base64,' + btoa(svg);
   }
 
-  var AGENTS = ['claude-code', 'codex-cli', 'opencode', 'antigravity'];
+  var ME = { jid: '5551999990000@s.whatsapp.net', name: 'Você' };
+  var AGENTS = ['claude-code', 'codex', 'opencode'];
   var TOOLS = [
-    'wa_send_text', 'wa_read_messages', 'wa_list_chats', 'wa_media',
-    'wa_resolve_contact', 'wa_usage', 'wa_mark_read', 'wa_react',
-    'wa_cancel', 'wa_set_alias', 'wa_session_status', 'wa_send_media'
+    ['wa_read_messages', 0.30, 320], ['wa_search', 0.16, 45], ['wa_list_chats', 0.14, 90],
+    ['wa_media', 0.08, 4800], ['wa_resolve_contact', 0.08, 80], ['wa_send_text', 0.07, 2200],
+    ['wa_group_participants', 0.05, 140], ['wa_mark_read', 0.04, 70], ['wa_session_status', 0.04, 9],
+    ['wa_react', 0.02, 60], ['wa_usage', 0.02, 40]
+  ];
+  var CHATS = [
+    { jid: '5551988887777@s.whatsapp.net', name: 'Ana' },
+    { jid: '5551977776666@s.whatsapp.net', name: 'Rogério Alves' },
+    { jid: '5551966665555@s.whatsapp.net', name: 'Paulo Mendes' },
+    { jid: '120363000000000001@g.us', name: 'Padel de segunda' },
+    { jid: '120363000000000002@g.us', name: 'Libreta · professores' },
+    { jid: '5551955554444@s.whatsapp.net', name: 'Mãe' }
   ];
 
-  function pick(arr, i) { return arr[i % arr.length]; }
+  // ------------------------------------------------------------- métricas
 
-  function buildTimeline(windowMs) {
-    var buckets, bucketMs;
-    if (windowMs <= 3600000) { buckets = 12; bucketMs = 5 * 60 * 1000; }
-    else if (windowMs <= 86400000) { buckets = 24; bucketMs = 60 * 60 * 1000; }
-    else if (windowMs <= 604800000) { buckets = 14; bucketMs = 12 * 60 * 60 * 1000; }
-    else { buckets = 30; bucketMs = 24 * 60 * 60 * 1000; }
-
-    var out = [];
-    var start = NOW - windowMs;
-    for (var i = 0; i < buckets; i++) {
-      var bucketTs = start + i * bucketMs;
-      // alguns buckets propositalmente vazios, para validar que não interpola
-      var isEmpty = i % 7 === 3 || i % 11 === 0;
-      if (isEmpty) {
-        out.push({ bucketTs: bucketTs, calls: 0, sends: 0, errors: 0 });
-        continue;
-      }
-      var base = 3 + Math.round(6 * Math.abs(Math.sin(i * 0.7)));
-      var calls = base + (i % 5);
-      var sends = Math.max(0, Math.round(calls * 0.3) - (i % 3));
-      var errors = i % 9 === 0 ? Math.max(1, Math.round(calls * 0.15)) : (i % 4 === 0 ? 1 : 0);
-      out.push({ bucketTs: bucketTs, calls: calls, sends: sends, errors: errors });
-    }
-    return out;
+  function bucketMs(windowMs) {
+    if (windowMs <= 2 * HOUR) return 5 * MIN;
+    if (windowMs <= 2 * DAY) return HOUR;
+    return DAY;
   }
 
-  function buildByAgent() {
-    var defs = [
-      { agent: 'claude-code', calls: 482, errRate: 0.03, sendRate: 0.18, p50: 210, p95: 980 },
-      { agent: 'codex-cli', calls: 156, errRate: 0.06, sendRate: 0.22, p50: 340, p95: 1420 },
-      { agent: 'opencode', calls: 64, errRate: 0.02, sendRate: 0.1, p50: 180, p95: 610 },
-      { agent: 'antigravity', calls: 21, errRate: 0.1, sendRate: 0.05, p50: 290, p95: 1100 }
-    ];
-    return defs.map(function (d) {
+  function summaryFor(windowMs, empty) {
+    seed = 7;
+    var size = bucketMs(windowMs);
+    var start = Math.floor((NOW - windowMs) / size) * size;
+    var timeline = [];
+    var scale = windowMs <= HOUR ? 0.15 : windowMs <= DAY ? 1 : 7;
+    for (var ts = start; ts <= NOW; ts += size) {
+      var hour = new Date(ts).getHours();
+      var awake = windowMs > DAY || (hour >= 8 && hour <= 23);
+      var calls = empty || !awake ? 0 : Math.round((20 + rnd() * 70) * scale);
+      var errors = calls && rnd() > 0.7 ? Math.max(1, Math.round(calls * 0.03)) : 0;
+      var sends = calls && rnd() > 0.35 ? Math.max(1, Math.round((rnd() * 6) * Math.max(scale / 3, 0.3))) : 0;
+      timeline.push({ bucketTs: ts, calls: calls, errors: errors, sends: sends });
+    }
+    var sum = function (k) { return timeline.reduce(function (a, b) { return a + b[k]; }, 0); };
+    var totals = {
+      calls: sum('calls'), errors: sum('errors'), sends: sum('sends'),
+      cancels: empty ? 0 : 2, blocked: empty ? 0 : 1, mediaProcessed: empty ? 0 : Math.round(sum('calls') * 0.03),
+      messagesRead: empty ? 0 : Math.round(sum('calls') * 0.3)
+    };
+    var previousTotals = {
+      calls: Math.round(totals.calls * 0.88), errors: totals.errors + 2, sends: totals.sends + 3,
+      cancels: 1, blocked: 0, mediaProcessed: totals.mediaProcessed, messagesRead: totals.messagesRead
+    };
+    var shares = [0.62, 0.31, 0.07];
+    var seen = [NOW - 40 * 1000, NOW - 3 * HOUR, NOW - 2 * DAY];
+    var byAgent = empty ? [] : AGENTS.map(function (agent, i) {
+      var calls = Math.round(totals.calls * shares[i]);
       return {
-        agent: d.agent,
-        calls: d.calls,
-        errors: Math.round(d.calls * d.errRate),
-        sends: Math.round(d.calls * d.sendRate),
-        p50Ms: d.p50,
-        p95Ms: d.p95
+        agent: agent, calls: calls, errors: Math.round(totals.errors * shares[i]),
+        sends: Math.round(totals.sends * shares[i]), p50Ms: 60 + i * 40, p95Ms: 320 + i * 500,
+        lastCallAt: windowMs < 2 * DAY && i === 2 ? null : seen[i]
+      };
+    }).filter(function (a) { return a.calls > 0; });
+    var byTool = empty ? [] : TOOLS.map(function (t, i) {
+      var calls = Math.round(totals.calls * t[1]);
+      return { tool: t[0], calls: calls, errors: i === 3 ? Math.round(totals.errors * 0.6) : (i === 5 ? Math.round(totals.errors * 0.4) : 0), p95Ms: t[2] };
+    });
+    return {
+      windowMs: windowMs, generatedAt: NOW, totals: totals, previousTotals: previousTotals,
+      byAgent: byAgent, byTool: byTool, timeline: timeline, session: sessions.open
+    };
+  }
+
+  var calls = [];
+  (function () {
+    seed = 3;
+    var errors = [
+      ['error', 'MEDIA_EXPIRED: mídia antiga demais, o WhatsApp já descartou o arquivo', 'wa_media'],
+      ['denied', 'rascunho exige acknowledge NEVER_CONTACTED', 'wa_send_text'],
+      ['error', 'AMBIGUOUS_CONTACT: "ana" casou com 2 contatos', 'wa_send_text']
+    ];
+    for (var i = 0; i < 100; i++) {
+      var tool = pick(TOOLS);
+      var e = i % 9 === 2 ? errors[(i / 9 | 0) % errors.length] : null;
+      calls.push({
+        ts: NOW - i * 97 * 1000,
+        traceId: 'c' + (100000 + i * 7919).toString(16) + '-' + (i * 2654435761 >>> 0).toString(16) + '-4e0e',
+        agent: i % 5 === 0 ? 'codex' : 'claude-code',
+        tool: e ? e[2] : tool[0],
+        durationMs: Math.round(tool[2] * (0.4 + rnd())),
+        status: e ? e[0] : 'ok',
+        error: e ? e[1] : null
+      });
+    }
+  })();
+
+  var audit = [];
+  (function () {
+    var defs = [
+      ['send.completed', 'ok', CHATS[0].jid, {}],
+      ['draft.created', 'ok', CHATS[3].jid, {}],
+      ['media.materialized', 'ok', CHATS[1].jid, {}],
+      ['send.blocked', 'denied', 'status@broadcast', { reason: 'status@broadcast está na blocklist padrão' }],
+      ['send.cancelled', 'ok', CHATS[3].jid, { stage: 'typing' }],
+      ['send.cancelled', 'ok', CHATS[0].jid, { stage: 'draft' }],
+      ['alias.set', 'ok', CHATS[5].jid, { alias: 'mãe' }],
+      ['send.failed', 'error', CHATS[2].jid, { reason: 'timeout aguardando ack do WhatsApp' }],
+      ['session.paired', 'ok', null, {}]
+    ];
+    for (var i = 0; i < 50; i++) {
+      var d = defs[i % defs.length];
+      audit.push({ ts: NOW - i * 23 * MIN, traceId: 't' + i, agent: i % 4 === 0 ? 'codex' : 'claude-code', action: d[0], chatJid: d[2], outcome: d[1], detail: d[3] });
+    }
+  })();
+
+  var sessions = {
+    open: { state: 'open', me: ME, qrDataUrl: null, since: NOW - (3 * HOUR + 12 * MIN), lastError: null },
+    pairing: { state: 'pairing', me: null, qrDataUrl: fakeQrDataUrl(0), since: NOW - 30000, lastError: null },
+    connecting: { state: 'connecting', me: null, qrDataUrl: null, since: NOW - 5000, lastError: null },
+    close: { state: 'close', me: null, qrDataUrl: null, since: NOW - 20 * MIN, lastError: 'sessão deslogada: é preciso parear de novo' }
+  };
+
+  // ------------------------------------------------------------------ gate
+
+  var drafts = [
+    {
+      id: '7a1c2e9b0d4f3a21', chatJid: CHATS[0].jid, name: 'Ana', maskedNumber: '+55 51 ****-7777',
+      bubbles: ['Vou chegar tarde hoje, por volta das 21h.', 'Guarda janta?'], mediaPath: null, warnings: [], mentions: 0,
+      agent: 'claude-code', createdAt: NOW - 78000, expiresAt: NOW + 222000
+    },
+    {
+      id: '3f9e8d7c6b5a4021', chatJid: CHATS[3].jid, name: 'Padel de segunda', maskedNumber: 'grupo',
+      bubbles: ['@5551977776666 o placar de segunda já está no app, confere?'], mediaPath: null,
+      warnings: ['GROUP_CHAT'], mentions: 1, agent: 'codex', createdAt: NOW - 259000, expiresAt: NOW + 41000
+    }
+  ];
+  var sends = [
+    { sendId: 'snd_mock_1', chatJid: CHATS[3].jid, name: 'Padel de segunda', stage: 'typing', bubblesTotal: 3, bubblesSent: 1, agent: 'claude-code', startedAt: NOW - 8000 }
+  ];
+
+  function gate(empty) {
+    var elapsed = Date.now() - NOW;
+    var live = sends.map(function (s) {
+      var sent = Math.min(s.bubblesTotal - 1, s.bubblesSent + Math.floor(elapsed / 9000));
+      return Object.assign({}, s, { bubblesSent: sent });
+    });
+    return {
+      sendsLastHour: empty ? 0 : 3, sendsPerHour: 10, quietHours: { active: false, window: '23:00-07:00' },
+      draftTtlMs: 300000,
+      drafts: empty ? [] : drafts.filter(function (d) { return d.expiresAt > Date.now(); }),
+      sends: empty ? [] : live
+    };
+  }
+
+  // ---------------------------------------------------------------- status
+
+  function status(empty) {
+    return {
+      version: '0.1.0', pid: 48861, node: 'v24.18.0', startedAt: NOW - 3 * HOUR, service: 'launchd (local.wa-bridge)',
+      schemaVersion: 2, dbBytes: empty ? 98304 : 3456789,
+      media: { bytes: empty ? 0 : 134217728, files: empty ? 0 : 412, measuredAt: NOW },
+      retention: { messagesDays: 365, mediaDays: 30, metricsDays: 30, last: { at: NOW - 2 * HOUR, result: { messages: 0, mediaFiles: 12, calls: 380, drafts: 4 } } },
+      historyDays: 7, mediaQueue: { running: 0, queued: 0, max: 10 }, eventStreams: 1,
+      whisperModel: { name: 'ggml-large-v3-turbo.bin', present: true }, stateDirMode: '700'
+    };
+  }
+
+  // ----------------------------------------------------------------- busca
+
+  var corpus = [
+    { chat: CHATS[3], sender: 'Paulo', when: NOW - 40 * MIN, source: 'text', text: 'Fechou, quadra 3 às 19h então, quem leva bola?' },
+    { chat: CHATS[1], sender: null, when: NOW - DAY, source: 'transcript', text: 'o pix da inscrição do americano de segunda cai direto na minha chave, depois te mando o print' },
+    { chat: CHATS[4], sender: 'Martín', when: NOW - 3 * DAY, source: 'text', text: 'Consegue colocar a aula experimental como pacote? Os alunos pedem toda semana' },
+    { chat: CHATS[0], sender: null, when: NOW - 4 * HOUR, source: 'text', text: 'Não esquece de pagar o pix do condomínio hoje' },
+    { chat: CHATS[2], sender: null, when: NOW - 2 * DAY, source: 'transcript', text: 'toda vez que eu fecho o app ele desloga, aí tenho que pedir o código de novo' },
+    { chat: CHATS[5], sender: null, when: NOW - 5 * HOUR, source: 'text', text: 'Domingo vai ter churrasco aqui, avisa a Ana' }
+  ];
+
+  function normalize(s) { return s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+
+  function searchHits(q) {
+    var terms = normalize(q).split(/\s+/).map(function (t) { return t.replace(/\*$/, ''); }).filter(Boolean);
+    return corpus.filter(function (m) {
+      var n = normalize(m.text);
+      return terms.every(function (t) { return n.indexOf(t) !== -1; });
+    }).map(function (m) {
+      var n = normalize(m.text);
+      var snippet = '';
+      var pos = 0;
+      terms.map(function (t) { return [n.indexOf(t), t.length]; }).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (hit) {
+        if (hit[0] < pos) return;
+        snippet += m.text.slice(pos, hit[0]) + '«' + m.text.slice(hit[0], hit[0] + hit[1]) + '»';
+        pos = hit[0] + hit[1];
+      });
+      snippet += m.text.slice(pos);
+      return {
+        message: { id: 'm' + m.when, chatJid: m.chat.jid, senderName: m.sender, fromMe: false, ts: m.when, type: m.source === 'transcript' ? 'audio' : 'text', text: m.text },
+        chatName: m.chat.name, source: m.source, snippet: snippet
       };
     });
   }
 
-  function buildByTool() {
-    var defs = [
-      { tool: 'wa_read_messages', calls: 310, errRate: 0.01, p95: 320 },
-      { tool: 'wa_list_chats', calls: 190, errRate: 0.0, p95: 140 },
-      { tool: 'wa_send_text', calls: 118, errRate: 0.05, p95: 2200 },
-      { tool: 'wa_media', calls: 61, errRate: 0.08, p95: 4800 },
-      { tool: 'wa_resolve_contact', calls: 44, errRate: 0.0, p95: 90 },
-      { tool: 'wa_usage', calls: 38, errRate: 0.0, p95: 60 },
-      { tool: 'wa_mark_read', calls: 22, errRate: 0.0, p95: 70 },
-      { tool: 'wa_cancel', calls: 6, errRate: 0.0, p95: 50 },
-      { tool: 'wa_react', calls: 5, errRate: 0.0, p95: 80 },
-      { tool: 'wa_set_alias', calls: 3, errRate: 0.0, p95: 40 }
-    ];
-    return defs.map(function (d) {
-      return { tool: d.tool, calls: d.calls, errors: Math.round(d.calls * d.errRate), p95Ms: d.p95 };
+  // ------------------------------------------------------------- roteador
+
+  function fetchMock(path, method, body, variant, state) {
+    return new Promise(function (resolve, reject) {
+      setTimeout(function () {
+        if (variant === 'error' && path.indexOf('/health') !== 0) {
+          reject(new TypeError('daemon indisponível (mock)'));
+          return;
+        }
+        var empty = variant === 'empty';
+        var sessionVariant = (variant === 'pairing' || variant === 'close' || variant === 'connecting') ? variant : 'open';
+        if (path.indexOf('/health') === 0) {
+          resolve({ ok: true, version: '0.1.0', session: { state: sessions[sessionVariant].state, since: NOW }, account: { label: qs.get('label'), description: null, color: qs.get('color'), tokenPath: '~/.wa-bridge/token' } });
+        } else if (path.indexOf('/metrics/summary') === 0) {
+          resolve(summaryFor(state.windowMs, empty));
+        } else if (path.indexOf('/metrics/calls') === 0) {
+          resolve({ calls: empty ? [] : calls.slice(0, state.callsLimit) });
+        } else if (path.indexOf('/metrics/audit') === 0) {
+          resolve({ events: empty ? [] : audit.slice(0, state.auditLimit) });
+        } else if (path.indexOf('/session/pair') === 0) {
+          resolve({ started: true });
+        } else if (path.indexOf('/session') === 0) {
+          var s = sessions[sessionVariant];
+          if (sessionVariant === 'pairing') s.qrDataUrl = fakeQrDataUrl(Math.floor(Date.now() / 20000));
+          resolve(s);
+        } else if (path.indexOf('/gate/drafts/') === 0 && method === 'POST') {
+          var id = decodeURIComponent(path.split('/')[3]);
+          var before = drafts.length;
+          drafts = drafts.filter(function (d) { return d.id !== id; });
+          resolve({ discarded: drafts.length < before });
+        } else if (path.indexOf('/gate') === 0) {
+          resolve(gate(empty));
+        } else if (path.indexOf('/send/cancel') === 0) {
+          sends = sends.filter(function (x) { return x.sendId !== (body && body.sendId); });
+          resolve({ cancelled: true, stage: 'typing' });
+        } else if (path.indexOf('/status') === 0) {
+          resolve(status(empty));
+        } else if (path.indexOf('/search') === 0) {
+          var q = new URLSearchParams(path.split('?')[1] || '').get('q') || '';
+          resolve({ hits: empty ? [] : searchHits(q) });
+        } else {
+          reject(new Error('rota mock desconhecida: ' + path));
+        }
+      }, 120);
     });
   }
 
-  function buildCalls(limit) {
-    var out = [];
-    var statuses = ['ok', 'ok', 'ok', 'ok', 'ok', 'error', 'ok', 'denied'];
-    for (var i = 0; i < limit; i++) {
-      var status = pick(statuses, i * 3 + 1);
-      out.push({
-        id: limit - i,
-        ts: NOW - i * 97000,
-        traceId: 'tr_' + (1000 + i).toString(36),
-        agent: pick(AGENTS, i),
-        tool: pick(TOOLS, i * 2),
-        durationMs: 40 + Math.round(1800 * Math.abs(Math.sin(i * 1.3))),
-        status: status,
-        error: status === 'error' ? pick([
-          'timeout aguardando ack do Baileys',
-          'ffmpeg: formato de áudio não suportado',
-          'rate limit: 10 envios/hora excedido',
-          'contato ambíguo: múltiplos matches'
-        ], i) : (status === 'denied' ? 'draft requer acknowledge NEVER_CONTACTED' : null)
-      });
-    }
-    return out;
-  }
+  // ------------------------------------------------------------ feed fake
 
-  function buildAudit(limit) {
-    var actions = [
-      { action: 'send.completed', outcome: 'ok' },
-      { action: 'draft.created', outcome: 'ok' },
-      { action: 'send.confirmed', outcome: 'ok' },
-      { action: 'send.blocked', outcome: 'denied' },
-      { action: 'send.cancelled', outcome: 'ok' },
-      { action: 'media.materialized', outcome: 'ok' },
-      { action: 'alias.set', outcome: 'ok' },
-      { action: 'session.paired', outcome: 'ok' },
-      { action: 'send.failed', outcome: 'error' }
-    ];
-    var jids = ['556199998888@s.whatsapp.net', '556288887777@s.whatsapp.net', '120363012345678901@g.us', '554796665544@s.whatsapp.net'];
-    var out = [];
-    for (var i = 0; i < limit; i++) {
-      var def = pick(actions, i * 5 + 2);
-      var jid = pick(jids, i);
-      var detailText = i === 2
-        ? 'bubble 1/2: "Oi, bora marcar aquele café amanhã? <script>alert(1)</script>"'
-        : (def.action === 'send.blocked' ? 'destino na blocklist (status@broadcast)' : 'ok');
-      out.push({
-        id: limit - i,
-        ts: NOW - i * 210000,
-        traceId: 'tr_' + (2000 + i).toString(36),
-        agent: pick(AGENTS, i + 1),
-        action: def.action,
-        chatJid: jid,
-        outcome: def.outcome,
-        detail: { note: detailText, bubbles: 1 + (i % 3) }
-      });
-    }
-    return out;
-  }
+  var incoming = [
+    { chat: CHATS[2], sender: null, type: 'text', text: 'Saiu do app de novo, mesma coisa de ontem' },
+    { chat: CHATS[3], sender: 'Allan', type: 'text', text: 'Alguém tem bola sobrando?' },
+    { chat: CHATS[1], sender: null, type: 'image', text: '[Imagem] pódio do americano', caption: 'pódio do americano' },
+    { chat: CHATS[0], sender: null, type: 'audio', text: '[Áudio enviado]' },
+    { chat: CHATS[4], sender: 'Martín', type: 'text', text: 'Amanhã cancelo a turma das 7h, choveu demais' }
+  ];
+  var nextIncoming = 0;
 
-  function summaryFor(windowMs) {
-    var byAgent = buildByAgent();
-    var byTool = buildByTool();
-    var totals = {
-      calls: byAgent.reduce(function (s, a) { return s + a.calls; }, 0),
-      errors: byAgent.reduce(function (s, a) { return s + a.errors; }, 0),
-      sends: byAgent.reduce(function (s, a) { return s + a.sends; }, 0),
-      cancels: 7,
-      blocked: 4,
-      mediaProcessed: 61,
-      messagesRead: 893
-    };
+  function toEvent(m, ts) {
     return {
-      windowMs: windowMs,
-      generatedAt: Date.now(),
-      totals: totals,
-      byAgent: byAgent,
-      byTool: byTool,
-      timeline: buildTimeline(windowMs),
-      session: SESSION_OPEN
+      chatName: m.chat.name,
+      message: { id: 'live' + ts, chatJid: m.chat.jid, senderName: m.sender, fromMe: false, ts: ts, type: m.type, text: m.text, caption: m.caption || null, hasMedia: m.type !== 'text' }
     };
   }
 
-  var SESSION_OPEN = {
-    state: 'open',
-    me: { jid: '555199990000@s.whatsapp.net', name: 'Você' },
-    qrDataUrl: null,
-    since: NOW - 3 * 60 * 60 * 1000 - 42 * 60 * 1000,
-    lastError: null
-  };
-
-  var SESSION_PAIRING = {
-    state: 'pairing',
-    me: null,
-    qrDataUrl: fakeQrDataUrl(),
-    since: NOW - 8000,
-    lastError: null
-  };
-
-  var SESSION_CONNECTING = {
-    state: 'connecting',
-    me: null,
-    qrDataUrl: null,
-    since: NOW - 4000,
-    lastError: null
-  };
-
-  var SESSION_CLOSE = {
-    state: 'close',
-    me: { jid: '555199990000@s.whatsapp.net', name: 'Você' },
-    qrDataUrl: null,
-    since: NOW - 20 * 60 * 1000,
-    lastError: 'Connection Closed (device_removed)'
-  };
-
-  function emptySummary(windowMs) {
-    return {
-      windowMs: windowMs,
-      generatedAt: Date.now(),
-      totals: { calls: 0, errors: 0, sends: 0, cancels: 0, blocked: 0, mediaProcessed: 0, messagesRead: 0 },
-      byAgent: [],
-      byTool: [],
-      timeline: buildTimeline(windowMs).map(function (b) { return { bucketTs: b.bucketTs, calls: 0, sends: 0, errors: 0 }; }),
-      session: SESSION_OPEN
-    };
+  /** Simula o stream /events: 3 mensagens recentes na hora e uma nova a cada 7s. */
+  function startFeed(cb) {
+    [3, 2, 1].forEach(function (i) { cb(toEvent(incoming[i], Date.now() - i * 4 * MIN)); });
+    return setInterval(function () {
+      cb(toEvent(incoming[nextIncoming++ % incoming.length], Date.now()));
+    }, 7000);
   }
 
-  window.WA_MOCK = {
-    sessions: {
-      open: SESSION_OPEN,
-      pairing: SESSION_PAIRING,
-      connecting: SESSION_CONNECTING,
-      close: SESSION_CLOSE
-    },
-    summaryFor: summaryFor,
-    emptySummary: emptySummary,
-    calls: buildCalls(60),
-    audit: buildAudit(40)
-  };
+  window.WA_MOCK = { fetch: fetchMock, startFeed: startFeed };
 })();

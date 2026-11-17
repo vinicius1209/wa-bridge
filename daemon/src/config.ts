@@ -24,6 +24,16 @@ export interface AccountInfo {
   tokenPath: string;
 }
 
+/** Janelas de retenção em dias; `0` desliga a limpeza daquele item. */
+export interface RetentionConfig {
+  /** Mensagens (e a mídia delas) mais velhas que isto saem do banco. */
+  messagesDays: number;
+  /** Arquivos de mídia no disco; a transcrição continua no banco. */
+  mediaDays: number;
+  /** `metrics_calls` e rascunhos já finalizados. */
+  metricsDays: number;
+}
+
 export interface QuietHours {
   startMinute: number;
   endMinute: number;
@@ -50,6 +60,19 @@ export interface Config {
   sendMaxDelayMs: number;
   draftTtlMs: number;
   sendsPerHour: number;
+  /** Teto de envios em 24h, somando todas as conversas. */
+  sendsPerDay: number;
+  /** Envios para quem nunca conversou com o usuário, em 24h; `0` não deixa iniciar conversa. */
+  newContactsPerDay: number;
+  /** Intervalo mínimo entre dois envios para a mesma conversa; `0` desliga. */
+  chatMinIntervalMs: number;
+  /** Dias de histórico importados no pareamento (`messaging-history.set`); `0` desliga. */
+  historyDays: number;
+  /** Teto de mídias processadas (download, transcrição, keyframes) ao mesmo tempo. */
+  mediaConcurrency: number;
+  /** Nome com que o daemon aparece em "Aparelhos conectados" no celular (só no pareamento). */
+  deviceName: string;
+  retention: RetentionConfig;
   logLevel: string;
   version: string;
   account: AccountInfo;
@@ -67,6 +90,30 @@ function parseQuietHours(raw: string): QuietHours {
     endMinute: Number(eh) * 60 + Number(em),
     raw: raw.trim(),
   };
+}
+
+/** Até onde o nome do aparelho cabe sem ser cortado na lista do celular. */
+const DEVICE_NAME_MAX = 40;
+
+/** Lê `WA_DEVICE_NAME`; ausente ou vazio usa `wa-bridge`, longo demais falha o boot. */
+function deviceNameEnv(): string {
+  const raw = process.env.WA_DEVICE_NAME?.trim();
+  if (!raw) return 'wa-bridge';
+  if (raw.length > DEVICE_NAME_MAX) {
+    throw new Error(`WA_DEVICE_NAME inválido: "${raw}" (máximo ${DEVICE_NAME_MAX} caracteres)`);
+  }
+  return raw;
+}
+
+/** Lê uma variável inteira `>= min`; ausente usa o default, inválida falha o boot. */
+function intEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    throw new Error(`${name} inválido: "${raw}" (esperado inteiro >= ${min})`);
+  }
+  return value;
 }
 
 /** Lê o Bearer token do disco; gera um na primeira execução com chmod 600. */
@@ -152,6 +199,17 @@ export function loadConfig(): Config {
     sendMaxDelayMs: Number(process.env.WA_SEND_MAX_DELAY_MS ?? 45_000),
     draftTtlMs: Number(process.env.WA_DRAFT_TTL_MS ?? 300_000),
     sendsPerHour: Number(process.env.WA_SENDS_PER_HOUR ?? 10),
+    sendsPerDay: intEnv('WA_SENDS_PER_DAY', 40, 1),
+    newContactsPerDay: intEnv('WA_NEW_CONTACTS_PER_DAY', 3, 0),
+    chatMinIntervalMs: intEnv('WA_CHAT_MIN_INTERVAL_SECONDS', 30, 0) * 1000,
+    historyDays: intEnv('WA_HISTORY_DAYS', 7, 0),
+    mediaConcurrency: intEnv('WA_MEDIA_CONCURRENCY', 10, 1),
+    deviceName: deviceNameEnv(),
+    retention: {
+      messagesDays: intEnv('WA_RETENTION_MESSAGES_DAYS', 0, 0),
+      mediaDays: intEnv('WA_RETENTION_MEDIA_DAYS', 30, 0),
+      metricsDays: intEnv('WA_RETENTION_METRICS_DAYS', 30, 0),
+    },
     logLevel: process.env.LOG_LEVEL ?? 'info',
     version: VERSION,
     account: loadAccount(home),

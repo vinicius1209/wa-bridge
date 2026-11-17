@@ -277,14 +277,15 @@ async function waitWithPresence(
 }
 
 /**
- * Executa o plano: `composing` antes de cada bubble, `paused` entre bubbles,
- * `available` ao final ou ao abortar. Consulta `shouldAbort` antes de cada
+ * Executa o plano: `composing` antes de cada bubble, `paused` entre bubbles, ao final e
+ * ao abortar. Nunca `available`: marcar a conta como online faz o celular parar de
+ * notificar (ver `markOnlineOnConnect` na conexão). Consulta `shouldAbort` antes de cada
  * bubble e em toda reemissão de presença. Devolve os ids já enviados.
  */
 export async function executePlan(
   plan: DelayPlan,
   io: {
-    presence: (p: 'composing' | 'paused' | 'available') => Promise<void>;
+    presence: (p: 'composing' | 'paused') => Promise<void>;
     send: (bubble: string) => Promise<string>;
     shouldAbort: () => boolean;
   },
@@ -297,13 +298,13 @@ export async function executePlan(
     io.shouldAbort,
   );
   if (abortedDuringRead) {
-    await io.presence('available');
+    await io.presence('paused');
     return sent;
   }
 
   for (const bubble of plan.bubbles) {
     if (io.shouldAbort()) {
-      await io.presence('available');
+      await io.presence('paused');
       return sent;
     }
 
@@ -313,7 +314,7 @@ export async function executePlan(
       io.shouldAbort,
     );
     if (abortedWhileTyping) {
-      await io.presence('available');
+      await io.presence('paused');
       return sent;
     }
 
@@ -327,12 +328,12 @@ export async function executePlan(
         io.shouldAbort,
       );
       if (abortedWhilePaused) {
-        await io.presence('available');
+        await io.presence('paused');
         return sent;
       }
     }
   }
 
-  await io.presence('available');
+  await io.presence('paused');
   return sent;
 }

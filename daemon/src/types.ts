@@ -46,6 +46,19 @@ export interface StoredMessage {
   senderPhoneJid?: string | null;
 }
 
+/** Onde a busca casou: no texto da mensagem ou na transcrição do áudio/vídeo dela. */
+export type SearchSource = 'text' | 'transcript';
+
+/** Um resultado de `GET /search`: a mensagem inteira mais o trecho que casou. */
+export interface SearchHit {
+  message: StoredMessage;
+  /** Nome da conversa (grupo ou contato), quando conhecido. */
+  chatName: string | null;
+  source: SearchSource;
+  /** Trecho em volta do termo, com o termo entre « ». */
+  snippet: string;
+}
+
 /** Resumo de uma conversa para listagem. */
 export interface ChatSummary {
   jid: string;
@@ -121,6 +134,13 @@ export interface MediaArtifact {
   error: string | null;
 }
 
+/** Arquivos em disco de uma mídia materializada, para a retenção apagar. */
+export interface MediaFiles {
+  messageId: string;
+  path: string;
+  framePaths: string[];
+}
+
 // ----------------------------------------------------------------- contatos
 
 /** Contato conhecido, com apelido definido pelo usuário e datas de contato. */
@@ -193,6 +213,20 @@ export interface MentionPreview {
 }
 
 export type SendWarning = 'NEVER_CONTACTED' | 'QUIET_HOURS' | 'GROUP_CHAT' | 'LARGE_TEXT';
+
+/**
+ * Cota de conversas novas que o próprio WhatsApp informa à conta (`message-capping.update`
+ * do Baileys 7). Só existe depois que o servidor manda; contas sem restrição podem nunca
+ * receber. `status` é o `capping_status` dele (`NONE`, `FIRST_WARNING`, `SECOND_WARNING`,
+ * `CAPPED`).
+ */
+export interface NewChatQuota {
+  total: number | null;
+  used: number | null;
+  status: string | null;
+  cycleEndsAt: number | null;
+  receivedAt: number;
+}
 
 /** Rascunho devolvido ao agente, para o humano revisar antes de confirmar. */
 export interface SendDraft {
@@ -275,18 +309,22 @@ export interface AuditEvent {
 }
 
 /** Agregados que alimentam o dashboard. */
+export interface MetricsTotals {
+  calls: number;
+  errors: number;
+  sends: number;
+  cancels: number;
+  blocked: number;
+  mediaProcessed: number;
+  messagesRead: number;
+}
+
 export interface MetricsSummary {
   windowMs: number;
   generatedAt: number;
-  totals: {
-    calls: number;
-    errors: number;
-    sends: number;
-    cancels: number;
-    blocked: number;
-    mediaProcessed: number;
-    messagesRead: number;
-  };
+  totals: MetricsTotals;
+  /** Mesmos totais na janela imediatamente anterior, para o painel mostrar a variação. */
+  previousTotals: MetricsTotals;
   byAgent: {
     agent: string;
     calls: number;
@@ -294,8 +332,50 @@ export interface MetricsSummary {
     sends: number;
     p50Ms: number;
     p95Ms: number;
+    /** Última chamada do agente na janela (epoch ms), ou `null` se só há auditoria. */
+    lastCallAt: number | null;
   }[];
   byTool: { tool: string; calls: number; errors: number; p95Ms: number }[];
   timeline: { bucketTs: number; calls: number; sends: number; errors: number }[];
   session: SessionState;
+}
+
+// --------------------------------------------------------------- painel
+
+/** Rascunho pendente como o painel enxerga: sem o token de confirmação. */
+export interface PendingDraftView {
+  /** Id opaco (hash do token), suficiente para descartar e inútil para confirmar. */
+  id: string;
+  chatJid: string;
+  name: string | null;
+  maskedNumber: string;
+  bubbles: string[];
+  mediaPath: string | null;
+  warnings: SendWarning[];
+  mentions: number;
+  agent: string | null;
+  createdAt: number;
+  expiresAt: number;
+}
+
+/** Envio em execução (delay humano rodando), cancelável pelo `sendId`. */
+export interface ActiveSendView {
+  sendId: string;
+  chatJid: string;
+  name: string | null;
+  stage: string;
+  bubblesTotal: number;
+  bubblesSent: number;
+  agent: string | null;
+  startedAt: number;
+}
+
+/** Retrato do gate de envio para o painel (`GET /gate`). */
+export interface GateSnapshot {
+  sendsLastHour: number;
+  sendsPerHour: number;
+  quietHours: { active: boolean; window: string };
+  draftTtlMs: number;
+  drafts: PendingDraftView[];
+  sends: ActiveSendView[];
 }

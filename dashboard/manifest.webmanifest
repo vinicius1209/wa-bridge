@@ -1,0 +1,15 @@
+{
+  "name": "wa-bridge",
+  "short_name": "wa-bridge",
+  "description": "Painel do wa-bridge: sessão, rascunhos, envios e mensagens chegando.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "icons": [
+    { "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "app-icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

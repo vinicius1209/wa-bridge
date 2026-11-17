@@ -30,12 +30,16 @@ e não contém nenhuma lógica de negócio — só traduz tool call → HTTP →
 ## Stack
 
 - **Runtime**: Node 24 (ESM, `"type": "module"`), TypeScript 5.7 em strict.
-- **WhatsApp**: `@whiskeysockets/baileys` pinado em **`6.7.24`** (tag `legacy`;
-  a tag `latest` é um RC 7.0.0 e não deve ser usada sem validação de pareamento).
+- **WhatsApp**: `@whiskeysockets/baileys` pinado em **`7.0.0-rc14`** (tag `latest`),
+  versão exata, sem `^`: atualização só de propósito, validando a sessão.
 - **DB**: `node:sqlite` nativo (sem `better-sqlite3`, sem dependência nativa).
 - **HTTP**: Fastify 5. **Logs**: Pino 10. **MCP**: `@modelcontextprotocol/sdk` 1.x.
 - **Mídia**: `ffmpeg` e `whisper-cli` do PATH (ou `FFMPEG_BIN`/`WHISPER_BIN`).
-- **Dashboard**: HTML+CSS+JS vanilla, **sem build e sem CDN**, SVG à mão.
+- **Dashboard**: HTML+CSS+JS vanilla, **sem build e sem CDN**, SVG à mão. Fontes do
+  sistema (sem arquivo de fonte externo). Atualiza a cada 10s com `X-WA-Agent: dashboard`
+  e lê o `/events` com `fetch` (o `EventSource` do navegador não manda o token). Todo texto
+  vindo do daemon entra por `textContent`, nunca `innerHTML`. `?mock=1|empty|error|pairing|close`
+  exercita cada estado sem o daemon (`dashboard/mock-data.js`).
 - **Dev**: `tsx` para rodar, `tsc` para build. Sem bundler.
 
 Nada de ORM, nada de framework de frontend. Zero dependência nativa. Docker é opcional
@@ -52,10 +56,11 @@ wa-bridge/
 │   ├── types.ts                  tipos compartilhados (fonte da verdade)
 │   ├── config.ts                 env e paths
 │   ├── version.ts                versão, lida do package.json da raiz (fonte única)
-│   ├── index.ts                  bootstrap e ordem de inicialização
-│   ├── whatsapp/                 conexão Baileys
-│   ├── store/                    SQLite
-│   ├── media/                    download, transcrição, keyframes
+│   ├── index.ts                  bootstrap, ordem de inicialização e desligamento
+│   ├── whatsapp/                 conexão Baileys (ao vivo, fila offline e histórico)
+│   ├── store/                    SQLite, busca FTS5 e retenção
+│   ├── media/                    download, transcrição, keyframes, teto de concorrência
+│   ├── events/                   stream SSE de mensagens novas (`GET /events`)
 │   ├── api/                      HTTP (Fastify)
 │   ├── send/                     gate de envio, delay humano, menções, blocklist
 │   └── obs/                      log, métricas, auditoria
@@ -114,7 +119,20 @@ Docker), vira aviso no log, nunca falha de boot.
 | `WA_SEND_MAX_DELAY_MS` | `45000` | teto do delay humano por envio |
 | `WA_DRAFT_TTL_MS` | `300000` | validade do confirm token (5 min) |
 | `WA_SENDS_PER_HOUR` | `10` | rate limit global de envios |
+| `WA_SENDS_PER_DAY` | `40` | teto de envios em 24h, somando todas as conversas |
+| `WA_NEW_CONTACTS_PER_DAY` | `3` | primeiros contatos (quem nunca conversou com você) em 24h; `0` não deixa iniciar conversa |
+| `WA_CHAT_MIN_INTERVAL_SECONDS` | `30` | intervalo mínimo entre envios para a mesma conversa (`0` desliga) |
+| `WA_HISTORY_DAYS` | `7` | dias de histórico importados no pareamento (`0` desliga) |
+| `WA_DEVICE_NAME` | `wa-bridge` | nome em "Aparelhos conectados" no celular (até 40 caracteres); só vale no próximo pareamento |
+| `WA_MEDIA_CONCURRENCY` | `10` | teto de mídias processando ao mesmo tempo (cada whisper carrega o modelo) |
+| `WA_RETENTION_MESSAGES_DAYS` | `0` | mensagens (e a mídia delas) mais velhas saem do banco (`0`, o padrão, nunca apaga) |
+| `WA_RETENTION_MEDIA_DAYS` | `30` | arquivos de mídia saem do disco; a transcrição fica (`0` desliga) |
+| `WA_RETENTION_METRICS_DAYS` | `30` | `metrics_calls` e rascunhos vencidos (`0` desliga) |
 | `LOG_LEVEL` | `info` | |
+
+As variáveis inteiras novas (`WA_HISTORY_DAYS`, `WA_MEDIA_CONCURRENCY`, `WA_RETENTION_*`)
+falham o boot se vierem inválidas, em vez de virar `NaN`. O serviço launchd lê o `.env`
+pelo `bin/wa-bridge-daemon`, então valem igual no script e no serviço.
 
 ## Tipos (resumo — a definição real está em `daemon/src/types.ts`)
 
@@ -178,6 +196,15 @@ export interface SendDraft {
   expiresAt: number;
 }
 
+export type SearchSource = 'text' | 'transcript';
+
+export interface SearchHit {          // um resultado de GET /search
+  message: StoredMessage;             // sem senderPhoneJid: vai direto para o agente
+  chatName: string | null;            // nome do grupo ou do contato
+  source: SearchSource;               // casou no texto ou na transcrição
+  snippet: string;                    // trecho com o termo entre « »
+}
+
 export interface GroupParticipant {
   groupJid: string;
   jid: string;                 // id de ENDEREÇAMENTO do grupo (pode ser `@lid`)
@@ -209,18 +236,19 @@ export interface MentionPreview {
 
 ```ts
 export class WhatsAppConnection {
-  constructor(deps: { store: Store; log: Logger; metrics: Metrics; home: string });
+  constructor(deps: { store: Store; log: Logger; metrics: Metrics; home: string;
+                      historyDays: number });
   connect(): Promise<void>;
   close(): void;                            // desligamento: sem reconexão e SEM logout
   getSessionState(): SessionState;          // { state, me, qrDataUrl, since }
-  forcePair(): Promise<void>;               // derruba e gera QR novo
+  forcePair(): Promise<void>;               // logout do aparelho, apaga auth/ e gera QR novo
   onMessage(cb: (m: StoredMessage, raw: WAMessageContent) => void): void;
   sendText(chatJid: string, text: string, quoted?: WAMessage, mentions?: string[]): Promise<string>;
   sendMedia(chatJid: string, filePath: string, caption?: string,
             quoted?: WAMessage, mentions?: string[]): Promise<string>;
   getGroupParticipants(jid: string,
     opts?: { refresh?: boolean; maxAgeMs?: number }): Promise<GroupParticipant[]>;
-  setPresence(chatJid: string, p: 'composing' | 'paused' | 'available'): Promise<void>;
+  setPresence(chatJid: string, p: 'composing' | 'paused'): Promise<void>;  // nunca available
   markRead(chatJid: string): Promise<void>;
   react(chatJid: string, messageId: string, emoji: string): Promise<void>;
   getRawMessage(messageId: string): WAMessageContent | null;     // para o processador de mídia
@@ -229,14 +257,30 @@ export class WhatsAppConnection {
 }
 ```
 
-Entrada de mensagens, por origem:
+Entrada de mensagens, por origem. Em qualquer origem, `protocolMessage` de sincronização
+entre os aparelhos da conta (histórico, chaves, configurações; lista em
+`whatsapp/protocol.ts`) não vira mensagem: o celular manda isso na conversa do usuário com
+ele mesmo. Edição e "apagar para todos" não estão na lista. Também não viram mensagem o
+cabeçalho de álbum (`albumMessage`, só avisa quantas fotos vêm; cada foto chega como
+mensagem normal) e as cópias de mídia que chegam em `associatedChildMessage` (versão HD de
+foto ou vídeo e a parte em vídeo de foto com movimento): a original já está no banco.
+
 
 - **ao vivo** (`messages.upsert` com `notify`): `upsertMessage`, soma em não lidas,
-  dispara `onMessage`.
+  dispara `onMessage` (e o stream `/events`).
 - **fila offline** (`messages.upsert` com `append`): o que ficou no servidor enquanto o
   daemon estava fora, entregue na reconexão. Antes era descartado. Entra com
   `insertMessageIfNew` (repetida não duplica nem soma de novo), soma em não lidas e
   dispara `onMessage`.
+- **histórico** (`messaging-history.set`): o que o celular manda logo depois do
+  pareamento, filtrado para os últimos `WA_HISTORY_DAYS` dias, sem status, newsletter nem
+  lista de transmissão. Entra com `insertMessageIfNew`, **não** soma em não lidas, **não**
+  dispara `onMessage` e não vai para o cache em memória. Também nomeia as conversas da
+  janela. O WhatsApp só manda isso uma vez por pareamento: sessão que já estava pareada
+  só recebe o histórico pareando de novo. O socket sobe com `syncFullHistory: false` (o
+  Baileys 7 liga por padrão e o celular mandaria anos de conversa) e com o
+  `shouldSyncHistoryMessage` padrão, que processa tudo menos `FULL`. Recusar tudo nessa
+  função tira do Baileys o mapeamento LID -> telefone que vem no histórico.
 
 O timestamp pode vir como `Long`; a conversão usa o `toNumber` do Baileys (com
 `Number()` cru a mensagem ficava com a hora em que foi gravada).
@@ -255,10 +299,19 @@ guardada em `raw_json` (em grupo, sem o `participant` elas não pegam no app).
 ```ts
 export class Store {
   constructor(dbPath: string);
-  migrate(): void;
+  migrate(): void;                                 // passos versionados por PRAGMA user_version
+  schemaVersion(): number;
   close(): void;
   upsertMessage(m: StoredMessage, rawJson: string): void;   // não "desprocessa" media_state
-  insertMessageIfNew(m: StoredMessage, rawJson: string): boolean;   // fila offline
+  insertMessageIfNew(m: StoredMessage, rawJson: string): boolean;   // histórico e offline
+  searchMessages(opts: { query: string; chatJid?: string; since?: number;
+                         limit: number }): SearchHit[];
+  getChatName(jid: string): string | null;
+  deleteMessagesBefore(before: number): { deleted: number; files: MediaFiles[] };
+  mediaFilesProcessedBefore(before: number, limit: number): MediaFiles[];
+  markMediaPruned(messageId: string): void;        // some o arquivo, fica a transcrição
+  deleteCallsBefore(before: number): number;
+  deleteDraftsExpiredBefore(before: number): number;
   listChats(opts: { limit: number; onlyUnread: boolean }): ChatSummary[];
   listMessages(opts: { chatJid: string; limit: number; since?: number }): StoredMessage[];
   getMessage(id: string): StoredMessage | null;
@@ -301,10 +354,25 @@ por número.
 
 ```ts
 export class MediaProcessor {
-  constructor(deps: { wa: WhatsAppConnection; store: Store; log: Logger; home: string });
+  constructor(deps: { wa: WhatsAppConnection; store: Store; log: Logger; home: string;
+                      config: Config });
   materialize(messageId: string, opts?: { transcribe?: boolean; frames?: boolean }): Promise<MediaArtifact>;
 }
+// media/limiter.ts
+export class ConcurrencyLimiter {
+  constructor(max: number);
+  run<T>(task: () => Promise<T>): Promise<T>;      // FIFO; libera a vaga mesmo em erro
+}
 ```
+
+No máximo `WA_MEDIA_CONCURRENCY` (default 10) mídias processam ao mesmo tempo; o resto
+espera na fila. A deduplicação por `messageId` fica fora da fila: uma segunda chamada
+para a mesma mídia espera a mesma promise, sem ocupar outra vaga.
+
+Uma transcrição conhecida nunca se perde: `finish()` mantém a do banco quando o
+processamento novo não produziu uma (ex.: retenção apagou o arquivo e o download de
+novo deu `MEDIA_EXPIRED`). Áudio podado (`error: 'PRUNED'`) que já tem transcrição volta
+direto do cache, sem baixar de novo.
 
 Regras: idempotente (se já existe no disco e no store, retorna do cache);
 download via `downloadMediaMessage` do Baileys depois do unwrap de view-once;
@@ -340,8 +408,21 @@ Invariantes do gate — **quebrar qualquer um destes é falha de segurança**:
    exige `acknowledge: ['NEVER_CONTACTED']` no body. Esse é o caso de número
    alucinado e de contato não solicitado (o padrão que o WhatsApp pune).
 5. Quiet hours → `warnings` inclui `QUIET_HOURS`, confirm exige `urgent: true`.
-6. Sem envio em massa: no máximo **1 draft ativo por chat** e um rate limit de
-   **10 envios/hora global**. Estourar é 429, não fila.
+6. Sem envio em massa: no máximo **1 draft ativo por chat** e limites de volume,
+   checados no draft e de novo no confirm. Estourar é 429 `RATE_LIMITED`, não fila, com
+   `detail.scope` dizendo qual limite foi:
+   - `hour`: `WA_SENDS_PER_HOUR` (10) envios na última hora, somando todas as conversas;
+   - `day`: `WA_SENDS_PER_DAY` (40) nas últimas 24h;
+   - `chat`: menos de `WA_CHAT_MIN_INTERVAL_SECONDS` (30) desde o último envio para a mesma
+     conversa. Só no confirm (no draft travaria o agente enquanto o humano lê), vem com
+     `detail.retryAfterMs`, e o token continua valendo;
+   - `new_contacts`: `WA_NEW_CONTACTS_PER_DAY` (3) primeiros contatos em 24h, contados por
+     `sends.first_contact` (`0` não deixa iniciar conversa);
+   - `whatsapp_quota`: a cota de conversas novas que o próprio WhatsApp manda
+     (`message-capping.update`) está em `CAPPED` ou com 10% ou menos sobrando (mínimo 1).
+     Fica em memória até o fim do ciclo; conta sem restrição pode nunca receber.
+   Nenhum desses limites garante nada contra banimento: as regras do WhatsApp não são
+   públicas, e eles só tiram do caminho rajada, volume alto e conversa nova em série.
 7. O preview retornado contém nome resolvido, número mascarado (só os 4 últimos
    dígitos visíveis), último contato e o texto exato de cada bubble.
 8. Menção (`mentions`) só em grupo, e **só para quem está no grupo**: o
@@ -386,7 +467,7 @@ que não notifica ninguém. Regras:
 export function splitBubbles(text: string): string[];
 export function planDelay(bubbles: string[], seed?: number): DelayPlan;
 export async function executePlan(plan: DelayPlan, io: {
-  presence: (p: 'composing' | 'paused' | 'available') => Promise<void>;
+  presence: (p: 'composing' | 'paused') => Promise<void>;
   send: (bubble: string) => Promise<string>;
   shouldAbort: () => boolean;
 }): Promise<string[]>;
@@ -399,7 +480,9 @@ aborto; não documente como proteção contra banimento):
 - digitação: ~5 chars/s, **jitter log-normal** (σ≈0.25), teto de 20000ms por bubble
 - pausa entre bubbles: 800–2500ms
 - `composing` reemitido a cada 8000ms (expira no WhatsApp)
-- `paused` entre bubbles, `available` ao final
+- `paused` entre bubbles, ao final e ao abortar. **Nunca `available`**: o socket sobe com
+  `markOnlineOnConnect: false` e o daemon nunca aparece online, porque um aparelho online
+  faz o celular parar de notificar
 - total limitado por `WA_SEND_MAX_DELAY_MS`; se o plano estourar, comprime
   proporcionalmente em vez de truncar texto
 - `shouldAbort()` é consultado antes de CADA bubble — é o que faz `wa_cancel` funcionar
@@ -431,9 +514,59 @@ Redaction obrigatória no logger: nunca logue o conteúdo do token, credenciais
 Baileys, nem corpo completo de mensagem em nível `info` (texto só em `debug`).
 Todo log carrega `traceId`, e todo request HTTP gera um `traceId` propagado.
 
+### `daemon/src/store/retention.ts`
+
+```ts
+export const RETENTION_INTERVAL_MS: number;        // 6h
+export function runRetention(deps: { store: Store; log: Logger; config: Config },
+                             now?: number): Promise<RetentionResult>;
+```
+
+Roda no boot e a cada 6h. Mensagens mais velhas que `WA_RETENTION_MESSAGES_DAYS` saem do
+banco com a mídia delas (o índice FTS sai junto, por trigger) e os arquivos do disco.
+Arquivos de mídia processados há mais de `WA_RETENTION_MEDIA_DAYS` saem do disco (original,
+`.transcript.txt` e `.frames/`), e a linha de `media` vira `path: ''`, `error: 'PRUNED'`,
+**mantendo a transcrição** (que continua buscável); `messages.media_state` volta a
+`pending`, porque `wa_media` ainda pode baixar de novo. `metrics_calls` e rascunhos
+vencidos saem depois de `WA_RETENTION_METRICS_DAYS`. **A tabela `audit` nunca é tocada.**
+Nada fora de `config.mediaDir` é apagado, mesmo que um `path` aponte para fora.
+
+### `daemon/src/events/hub.ts`
+
+```ts
+export class EventHub {
+  constructor(maxClients?: number);                // default 20
+  hasRoom(): boolean;
+  attach(res: ServerResponse, filter: { includeFromMe: boolean; chatJid: string | null },
+         hello: unknown): () => void;              // devolve o detach
+  publishMessage(message: StoredMessage, chatName: string | null): void;
+  closeAll(): void;                                // no preClose do Fastify
+}
+```
+
+O `index.ts` liga `wa.onMessage` ao `publishMessage`, então só mensagem ao vivo e da fila
+offline vira evento; histórico importado não. Cliente com mais de 1 MB acumulado sem ler é
+derrubado.
+
+### `daemon/src/obs/status.ts`
+
+```ts
+export function detectService(env?: NodeJS.ProcessEnv): string | null;
+export class StatusProvider {
+  constructor(deps: { config: Config; store: Store; media: MediaProcessor; events: EventHub });
+  recordRetention(result: RetentionResult, at?: number): void;   // o index.ts chama a cada rodada
+  snapshot(now?: number): Promise<StatusSnapshot>;               // GET /status
+}
+```
+
+O serviço é detectado pelo ambiente: o launchd põe o rótulo do job em `XPC_SERVICE_NAME`,
+o systemd define `INVOCATION_ID`, e o Docker deixa `/.dockerenv`. Nada do retrato é
+segredo: sem token, credencial nem número.
+
 ### Desligamento (`index.ts`)
 
-SIGTERM/SIGINT: `api.close()` → `wa.close()` (socket encerrado sem logout, sem reconexão) →
+SIGTERM/SIGINT: `api.close()` (o `preClose` encerra os streams SSE, senão o close do HTTP
+esperaria para sempre) → `wa.close()` (socket encerrado sem logout, sem reconexão) →
 `metrics.flush()` → `store.close()` → `exit(0)`. Teto de 8s; passou disso, sai com 1.
 Envios interrompidos viram falha no próximo boot (`failOrphanSends`).
 
@@ -490,10 +623,54 @@ CREATE TABLE IF NOT EXISTS metrics_calls (
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics_calls(ts DESC);
 ```
 
+### Migrações
+
+`Store.migrate()` roda passos versionados por `PRAGMA user_version`, cada um uma única
+vez, em ordem e em transação (a versão é gravada na mesma transação). Bancos de antes do
+versionamento estão na versão 0. Schema novo = passo novo no fim da lista; nunca edite um
+passo já publicado.
+
+| Versão | Passo |
+|---|---|
+| 1 | schema acima (idempotente) + coluna `contacts.phone_jid` |
+| 2 | `idx_messages_ts` + índice de busca FTS5 (abaixo), com `rebuild` do que já existia |
+| 3 | apaga as `unknown` que são `protocolMessage` de sincronização entre aparelhos, gravadas antes do filtro de entrada |
+| 4 | coluna `sends.first_contact` (idempotente), que o limite de conversas novas por dia conta |
+| 5 | apaga as `unknown` que são cabeçalho de álbum ou cópia de mídia (HD, foto com movimento), gravadas antes do filtro de entrada |
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+
+-- conteúdo externo: só o índice, o texto continua em messages/media
+CREATE VIRTUAL TABLE messages_fts USING fts5(text, content='messages',
+  content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');
+CREATE VIRTUAL TABLE media_fts USING fts5(transcript, content='media',
+  content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');
+-- triggers AFTER INSERT / AFTER DELETE / AFTER UPDATE OF text|transcript mantêm os dois
+-- índices em sincronia (messages_fts_ai/_ad/_au, media_fts_ai/_ad/_au)
+```
+
+As tabelas FTS dependem do `rowid` implícito de `messages` e `media`. `VACUUM` pode
+renumerá-lo; o código nunca roda VACUUM, e quem rodar à mão precisa reconstruir o índice
+depois (`docs/OPERACAO.md`).
+
+`toFtsQuery` converte o texto livre do agente em query segura: cada termo vira frase entre
+aspas (todos obrigatórios) e `termo*` vira prefixo, então `"`, `:`, `-` ou `NEAR` nunca dão
+erro de sintaxe no MATCH.
+
 ## HTTP API (bind `127.0.0.1` sempre; `Authorization: Bearer <token>` em tudo menos `/health`)
 
 Header opcional `X-WA-Agent: <nome>` identifica o agente chamador; default `unknown`.
+Header opcional `X-WA-Tool: wa_<nome>` (o shim manda em toda chamada feita dentro de uma
+tool, via `AsyncLocalStorage`): as métricas registram o nome da tool em vez da rota HTTP.
+Valor fora de `^wa_[a-z_]{1,40}$` é ignorado.
 Toda resposta de erro: `{ error: { code: string, message: string, detail?: unknown } }`.
+
+**O que não entra nas métricas** (`shouldRecordCall`): chamadas do agente `dashboard` (o
+painel se identifica assim e consulta a cada 10s; antes virava quase todo o "uso"), os
+arquivos estáticos em `/dashboard/*`, o `/health` e o `/events` (conexão longa contaria
+como chamada lenta). `MetricsSummary` traz também `previousTotals` (mesmos totais na
+janela anterior, para a variação) e `byAgent[].lastCallAt`.
 
 | Método | Rota | Body / Query | Resposta |
 |---|---|---|---|
@@ -505,6 +682,8 @@ Toda resposta de erro: `{ error: { code: string, message: string, detail?: unkno
 | POST | `/contacts/alias` | `{ alias, jid }` | `{ ok: true }` |
 | GET | `/groups/:jid/participants` | `?refresh=false` | `{ participants: GroupMember[] }` |
 | GET | `/messages` | `?chat=<jid>&limit=50&since=<ms>` | `{ messages: StoredMessage[] }` |
+| GET | `/search` | `?q=<termos>&chat=<jid>&since=<ms>&limit=20` (máx. 100) | `{ hits: SearchHit[] }`, mais recentes primeiro; `q` vazio → 400 |
+| GET | `/events` | `?from_me=false&chat=<jid>` | stream SSE (`text/event-stream`): `ready` na conexão, `message` (`{ message, chatName }`, `id:` = id da mensagem) a cada mensagem nova, `: ping` a cada 25s. Máx. 20 streams (429 `TOO_MANY_STREAMS`) |
 | POST | `/media/:messageId` | `{ transcribe?, frames? }` | `MediaArtifact` |
 | POST | `/send/draft` | `DraftInput` | `SendDraft` |
 | POST | `/send/confirm` | `{ confirmToken, urgent?, acknowledge? }` | `{ sendId, etaMs }` |
@@ -515,7 +694,19 @@ Toda resposta de erro: `{ error: { code: string, message: string, detail?: unkno
 | GET | `/metrics/calls` | `?limit=100` | `{ calls: CallRecord[] }` |
 | GET | `/metrics/audit` | `?limit=100` | `{ events: AuditEvent[] }` |
 | POST | `/send/discard` | `{ confirmToken }` | `{ discarded }` |
+| GET | `/gate` | — | `GateSnapshot`: `sendsLastHour`, `sendsPerHour`, `quietHours { active, window }`, `draftTtlMs`, `drafts: PendingDraftView[]`, `sends: ActiveSendView[]` |
+| POST | `/gate/drafts/:id/discard` | — | `{ discarded }`; `id` é `draftIdFor(token)`, 404 `DRAFT_NOT_FOUND` se não houver |
+| GET | `/status` | — | `StatusSnapshot`: versão, pid, Node, serviço (`launchd (<rótulo>)`, `systemd`, `docker` ou `null`), schema, tamanho do banco, mídia em disco (medida no máximo 1x/min), retenção com a última rodada, dias de histórico, fila de mídia, streams abertos, modelo do whisper e permissão da pasta de estado |
 | GET | `/dashboard` | — | painel (HTML estático) |
+
+### Painel e o token de confirmação
+
+O painel lista os rascunhos pendentes (`GET /gate`) e pode **descartar**, mas nunca
+**confirmar**: cada rascunho sai com um `id` que é o hash (sha256, 16 hex) do token de
+confirmação, e o token em si nunca aparece em `/gate`. Descartar pelo `id` passa pelo
+mesmo `discardDraft` do agente (com auditoria). Aprovar continua sendo só no agente, depois
+de mostrar o preview ao humano. Envios em andamento vêm dos `abortFlags` em memória e são
+canceláveis por `POST /send/cancel` com o `sendId`.
 
 ### Telefone real por trás de LID (`phoneJid` / `senderPhoneJid`)
 
@@ -572,6 +763,7 @@ Se `to` for ambíguo (>1 match com score próximo), `/send/draft` responde **409
 | `wa_set_alias` | POST `/contacts/alias` |
 | `wa_group_participants` | GET `/groups/:jid/participants` |
 | `wa_read_messages` | GET `/messages` (sem `senderPhoneJid`) |
+| `wa_search` | GET `/search` |
 | `wa_media` | POST `/media/:id` |
 | `wa_send_text` | POST `/send/draft` ou `/send/confirm` (ver abaixo) |
 | `wa_send_media` | idem, com `mediaPath` |
