@@ -14,6 +14,7 @@ import makeWASocket, {
   toNumber,
   useMultiFileAuthState,
   type AnyMessageContent,
+  type Chat,
   type GroupParticipant as BaileysGroupParticipant,
   type WAMessage,
   type WAMessageContent,
@@ -46,11 +47,18 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 /** Validade do cache local de membros de grupo (`groupMetadata` tem rate limit). */
 const GROUP_PARTICIPANTS_TTL_MS = 3_600_000;
 
+const DAY_MS = 86_400_000;
+
 /**
- * De onde veio a mensagem: `live` (chegou agora) ou `offline` (fila entregue na
- * reconexão, o Baileys marca como `append`).
+ * De onde veio a mensagem: `live` (chegou agora), `offline` (fila entregue na reconexão,
+ * o Baileys marca como `append`) ou `history` (sincronização do pareamento).
  */
-type IngestSource = 'live' | 'offline';
+type IngestSource = 'live' | 'offline' | 'history';
+
+/** Status, newsletter e listas de transmissão não são conversa: ficam fora do histórico. */
+function isBroadcastJid(jid: string): boolean {
+  return jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter');
+}
 
 /**
  * `JSON.parse` que devolve `Buffer` onde o `JSON.stringify` gravou `{ type: 'Buffer', data }`.
@@ -235,6 +243,8 @@ export interface WhatsAppConnectionDeps {
   log: Logger;
   metrics: Metrics;
   home: string;
+  /** Dias de histórico importados no pareamento; `0` desliga a importação. */
+  historyDays: number;
 }
 
 /** Conexão Baileys com o WhatsApp, única para todo o daemon. */
@@ -242,6 +252,7 @@ export class WhatsAppConnection {
   private readonly store: Store;
   private readonly log: Logger;
   private readonly authDir: string;
+  private readonly historyDays: number;
   /** Ligado por `close()`: a partir daí nenhuma reconexão é agendada. */
   private closed = false;
 
@@ -257,6 +268,7 @@ export class WhatsAppConnection {
     this.store = deps.store;
     this.log = deps.log;
     this.authDir = join(deps.home, 'auth');
+    this.historyDays = deps.historyDays;
   }
 
   /** Abre a conexão com o WhatsApp, restaurando credenciais salvas quando existirem. */
@@ -338,6 +350,54 @@ export class WhatsAppConnection {
       const source: IngestSource = type === 'notify' ? 'live' : 'offline';
       for (const message of messages) this.handleIncomingMessage(message, source);
     });
+    socket.ev.on('messaging-history.set', ({ messages, chats, syncType, progress }) => {
+      if (socket !== this.socket) return;
+      this.importHistory(messages, chats, { syncType: syncType ?? null, progress: progress ?? null });
+    });
+  }
+
+  /**
+   * Importa o histórico que o celular manda logo depois do pareamento, só dos últimos
+   * `historyDays` dias. O WhatsApp manda isso uma vez por pareamento: numa sessão que já
+   * estava pareada, o histórico só chega pareando de novo (`./wa-bridge pair`).
+   *
+   * Histórico não é mensagem nova: não soma em não lidas, não sobrescreve o que já está
+   * no banco e não dispara `onMessage` (nem o stream de eventos).
+   */
+  private importHistory(
+    messages: WAMessage[],
+    chats: Chat[],
+    meta: { syncType: number | null; progress: number | null },
+  ): void {
+    if (this.historyDays <= 0) return;
+    const cutoffMs = Date.now() - this.historyDays * DAY_MS;
+    let imported = 0;
+    for (const raw of messages) {
+      const remoteJid = raw.key.remoteJid;
+      if (!remoteJid || isBroadcastJid(remoteJid)) continue;
+      if (toNumber(raw.messageTimestamp) * 1000 < cutoffMs) continue;
+      try {
+        if (this.handleIncomingMessage(raw, 'history')) imported += 1;
+      } catch (error) {
+        this.log.warn({ error, id: raw.key.id }, 'falha ao importar mensagem do histórico');
+      }
+    }
+    for (const chat of chats) {
+      if (!chat.id || isBroadcastJid(chat.id) || !chat.name?.trim()) continue;
+      if (toNumber(chat.conversationTimestamp) * 1000 < cutoffMs) continue;
+      const jid = normalizeJid(chat.id);
+      this.store.upsertChat({
+        jid,
+        name: chat.name.trim(),
+        isGroup: isJidGroup(jid) ?? false,
+        lastMessageAt: null,
+        unreadCount: 0,
+      });
+    }
+    this.log.info(
+      { importadas: imported, recebidas: messages.length, dias: this.historyDays, ...meta },
+      'histórico do WhatsApp importado',
+    );
   }
 
   /** Conteúdo de uma mensagem já vista (cache em memória ou `raw_json`), para o Baileys reenviar. */
@@ -563,8 +623,8 @@ export class WhatsAppConnection {
 
   /**
    * Converte e persiste uma mensagem, e notifica os callbacks registrados. Devolve `true`
-   * se a mensagem foi gravada. A fila offline só grava o que ainda não existe (pode
-   * repetir mensagens já vistas) e só o que é novo mexe em contadores.
+   * se a mensagem foi gravada. Histórico e fila offline só gravam o que ainda não existe
+   * (podem repetir mensagens já vistas) e só o que é novo mexe em contadores.
    */
   private handleIncomingMessage(raw: WAMessage, source: IngestSource = 'live'): boolean {
     const remoteJid = raw.key.remoteJid;
@@ -578,12 +638,15 @@ export class WhatsAppConnection {
     } else if (!this.store.insertMessageIfNew(stored, JSON.stringify(raw))) {
       return false;
     }
-    if (raw.message) this.rawMessages.set(stored.id, raw.message);
+    // Histórico não entra no cache em memória: são milhares de mensagens de uma vez e
+    // expulsariam as recentes. A mídia dele sai do `raw_json` persistido.
+    if (raw.message && source !== 'history') this.rawMessages.set(stored.id, raw.message);
 
     // `senderPn` é o telefone real por trás de um LID (`@lid`). É o único jeito de o
     // preview do gate mostrar um número verdadeiro em vez de formatar o LID como telefone.
-    this.updateChatAndContact(stored, extractSenderPn(raw));
+    this.updateChatAndContact(stored, extractSenderPn(raw), source !== 'history');
 
+    if (source === 'history') return true;
     this.log.debug({ chat: stored.chatJid, type: stored.type, source }, 'mensagem recebida');
 
     for (const cb of this.listeners) {
@@ -596,15 +659,18 @@ export class WhatsAppConnection {
     return true;
   }
 
-  /** Atualiza os registros de `chats` e `contacts` a partir de uma mensagem normalizada. */
-  private updateChatAndContact(m: StoredMessage, senderPn: string | null = null): void {
+  /**
+   * Atualiza os registros de `chats` e `contacts` a partir de uma mensagem normalizada.
+   * `countUnread = false` (histórico) registra a conversa sem somar em não lidas.
+   */
+  private updateChatAndContact(m: StoredMessage, senderPn: string | null = null, countUnread = true): void {
     const isGroup = isJidGroup(m.chatJid) ?? false;
     this.store.upsertChat({
       jid: m.chatJid,
       name: null,
       isGroup,
       lastMessageAt: m.ts,
-      unreadCount: m.fromMe ? 0 : 1,
+      unreadCount: m.fromMe || !countUnread ? 0 : 1,
     });
 
     if (m.senderJid) {

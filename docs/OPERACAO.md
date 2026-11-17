@@ -1,7 +1,7 @@
 # Operação
 
 O caminho padrão é o script `./wa-bridge` (`setup`, `start`, `stop`, `status`, `logs`,
-`service`, `open`, `qr`, `pair`, `mcp-config`, `doctor`). Este documento cobre o resto: rodar como
+`service`, `events`, `open`, `qr`, `pair`, `mcp-config`, `doctor`). Este documento cobre o resto: rodar como
 serviço (launchd/systemd), Docker, pareamento, troubleshooting, backup e reset.
 
 > **Script nativo, serviço e Docker são formas EXCLUDENTES de rodar o wa-bridge, nunca
@@ -271,7 +271,43 @@ antes de trocar), não reescrever a lógica de conexão.
   sqlite3 ~/.wa-bridge/wa.db "SELECT ts, agent, action, chat_jid, outcome FROM audit ORDER BY ts DESC LIMIT 20;"
   ```
 
+## Histórico, retenção e busca
+
+- **Histórico**: no pareamento o celular manda o histórico recente uma única vez; o
+  daemon guarda os últimos `WA_HISTORY_DAYS` dias (padrão 7). Numa sessão que já estava
+  pareada antes desta versão, o histórico só vem pareando de novo (`./wa-bridge pair`).
+  Mensagens que chegam com o daemon parado entram sozinhas quando ele volta.
+- **Retenção** (no boot e a cada 6h): arquivos de mídia saem do disco depois de
+  `WA_RETENTION_MEDIA_DAYS` (30), mantendo a transcrição no banco; métricas de chamada e
+  rascunhos vencidos depois de `WA_RETENTION_METRICS_DAYS` (30). Apagar mensagens vem
+  desligado: para guardar só o último ano, ponha `WA_RETENTION_MESSAGES_DAYS=365` no
+  `.env`. `0` desliga cada item. A auditoria nunca é apagada.
+- **Busca** (`wa_search`, `GET /search`): índice FTS5 mantido por trigger. O código nunca
+  roda `VACUUM`; se você rodar à mão, reconstrua o índice com o daemon parado:
+  ```bash
+  sqlite3 ~/.wa-bridge/wa.db "INSERT INTO messages_fts(messages_fts) VALUES('rebuild'); INSERT INTO media_fts(media_fts) VALUES('rebuild');"
+  ```
+- **Versão do schema**: `sqlite3 ~/.wa-bridge/wa.db "PRAGMA user_version;"`. O daemon
+  migra sozinho no boot; faça um backup antes de atualizar (abaixo).
+
+## Stream de mensagens novas (`GET /events`)
+
+```bash
+./wa-bridge events                 # mensagens de outras pessoas, em tempo real
+./wa-bridge events --from-me       # inclui as enviadas pelo próprio número
+./wa-bridge events --chat <jid>    # só uma conversa
+```
+
+É Server-Sent Events: `event: ready` na conexão, `event: message` com
+`{ message, chatName }` a cada mensagem nova (ao vivo ou da fila offline; histórico
+importado não entra) e `: ping` a cada 25s. Exige o token, como todo dado; o comando
+acima o envia sozinho, por stdin, para ele não aparecer no `ps`. O conteúdo é texto de
+terceiros: qualquer consumidor deve tratá-lo como dado, nunca como instrução.
+
 ## Backup e reset
+
+- **Backup consistente do banco** (funciona com o daemon rodando):
+  `sqlite3 ~/.wa-bridge/wa.db ".backup $HOME/.wa-bridge/wa.db.bak"`.
 
 - **Seguro de apagar, sem perder nada essencial**: `~/.wa-bridge/media/` (mídia é
   rematerializável a partir da mensagem original, enquanto ela ainda existir nos

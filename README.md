@@ -38,9 +38,14 @@ o WhatsApp com `device_removed`, então os agentes não podem abrir conexões pr
 
 O que vem junto:
 
-- **13 tools MCP**: listar conversas, ler mensagens, baixar e transcrever mídia,
-  resolver contatos e grupos por nome, enviar texto e mídia, citar mensagens, @marcar
-  pessoas em grupo, reagir, marcar como lido, cancelar envio.
+- **14 tools MCP**: listar conversas, ler mensagens, buscar em todas as conversas
+  (texto e transcrições), baixar e transcrever mídia, resolver contatos e grupos por nome,
+  enviar texto e mídia, citar mensagens, @marcar pessoas em grupo, reagir, marcar como
+  lido, cancelar envio.
+- **Histórico de 7 dias** importado no pareamento, e as mensagens que chegam com o daemon
+  parado entram quando ele volta.
+- **Stream de mensagens novas** (`GET /events`, Server-Sent Events) para notificação,
+  scripts ou um agente escutando: `./wa-bridge events`.
 - **Gate de envio**: rascunho → humano aprova → envio. Avisos para número nunca
   contatado, horário de silêncio e grupo; limite de 10 envios por hora; 1 rascunho por
   conversa; blocklist.
@@ -108,6 +113,7 @@ segurança).
 | `./wa-bridge setup [--model NOME \| --no-model]` | instala dependências, compila e baixa o modelo do whisper |
 | `./wa-bridge start` / `stop` / `restart` | sobe, para e reinicia o daemon (pelo launchd, se o serviço estiver instalado) |
 | `./wa-bridge service install\|uninstall\|status` | daemon como serviço do macOS: sobe no login e reinicia se cair |
+| `./wa-bridge events [--from-me] [--chat JID]` | acompanha as mensagens novas em tempo real |
 | `./wa-bridge status` | processo e estado da sessão do WhatsApp |
 | `./wa-bridge open` | abre o painel já autenticado |
 | `./wa-bridge qr` | salva o QR de pareamento como PNG e abre |

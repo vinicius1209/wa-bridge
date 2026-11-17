@@ -13,7 +13,7 @@ interpretável (transcrição de áudio/vídeo, caminho de imagem/PDF para você
 visão) — e enviar mensagens, mas todo envio passa por um gate de confirmação humana em
 dois passos. Você nunca envia nada sem um humano ter visto o preview.
 
-## As 13 tools
+## As 14 tools
 
 | Tool | Para quê | Input | Saída | Quando NÃO usar |
 |---|---|---|---|---|
@@ -23,6 +23,7 @@ dois passos. Você nunca envia nada sem um humano ter visto o preview.
 | `wa_set_alias` | gravar um apelido fixo para um JID | `alias`, `jid` | `{ ok: true }` | não invente alias sem o humano ter pedido explicitamente |
 | `wa_group_participants` | listar membros de um grupo (para @marcar alguém) | `group` (JID `@g.us`), `refresh?` | `{ participants: GroupMember[] }` com `jid`, `name`, `alias`, `maskedNumber`, `isAdmin` | o WhatsApp não manda nome de participante: só tem nome quem já falou no grupo ou está nos contatos. Não adivinhe quem é quem pelo número |
 | `wa_read_messages` | ler histórico de uma conversa | `chat` (JID), `limit?`, `since?` | `{ messages: StoredMessage[] }` — JSON estruturado, nunca prosa | não use para conversas que você não foi pedido para olhar |
+| `wa_search` | buscar um assunto em todas as conversas | `q` (termos; todos precisam aparecer; `termo*` = prefixo), `chat?`, `since?`, `limit?` (máx. 100) | `{ hits: SearchHit[] }`: `message`, `chatName`, `source` (`text` ou `transcript`), `snippet` com o termo entre « », mais recentes primeiro | não acha áudio que ainda não passou por `wa_media` (só busca transcrição já feita); não use para listar uma conversa inteira, use `wa_read_messages` |
 | `wa_media` | materializar mídia de uma mensagem (download, transcrição, keyframes) | `message_id`, `transcribe?` (default true), `frames?` (default true) | `MediaArtifact` com `path`, `transcript`, `framePaths`, `error` | não chame em laço para todas as mensagens de um chat "por garantia" — só quando a tarefa pedir aquela mídia |
 | `wa_send_text` | enviar texto — **dois modos**, ver seção dedicada abaixo | sem `confirm_token`: `to`, `text`, `mentions?`, `quote_message_id?`; com `confirm_token`: `confirm_token`, `urgent?`, `acknowledge?` | sem token: `SendDraft` (preview); com token: `{ sendId, etaMs }` | nunca chame o modo com `confirm_token` sem o humano ter visto o preview primeiro |
 | `wa_send_media` | enviar mídia (imagem/doc/áudio) — mesmo protocolo de dois passos | idem `wa_send_text`, com `media_path` e `caption?` no lugar de `text` | idem `wa_send_text` | mesma regra: preview antes de confirmar |
@@ -158,7 +159,8 @@ Vêm no array `warnings` do `SendDraft`. Nenhum deles bloqueia o draft; eles mud
 | `error` começa com | O que fazer |
 |---|---|
 | `MEDIA_EXPIRED` | mídia antiga demais; os servidores do WhatsApp já descartaram o arquivo. Não há como recuperar. |
-| `RAW_UNAVAILABLE` | o daemon não tem a mensagem original (chegou antes de ele estar rodando). Não há como baixar. |
+| `RAW_UNAVAILABLE` | o daemon não tem a mensagem original (é anterior à janela de histórico importada no pareamento). Não há como baixar. |
+| `PRUNED` | o arquivo foi apagado pela retenção (padrão: 30 dias), mas a `transcript` continua valendo. Para imagem ou vídeo, o daemon tenta baixar de novo; se vier `MEDIA_EXPIRED`, não há mais o arquivo. |
 | `DOWNLOAD_FAILED` | falha de rede ao baixar. Tente uma vez mais; se repetir, avise o humano. |
 | `WHISPER_MODEL_MISSING` / `WHISPER_FAILED` / `FFMPEG_*` | o arquivo foi baixado (`path` vale), mas a transcrição falhou. Avise o humano: é setup (`./wa-bridge doctor`). |
 
@@ -241,6 +243,7 @@ Grupos têm `maskedNumber: "grupo"`, nunca um número — grupo não tem telefon
 
 ## Receitas
 
+- **"O que falaram sobre X essa semana?" / "Quem mandou o Pix?"** → `wa_search({ q: "X", since: <7 dias atrás em ms> })` → para cada hit relevante, se precisar de contexto, `wa_read_messages({ chat: hit.message.chatJid, since: hit.message.ts - 3600000 })`. Cite a conversa (`chatName`) e quem falou (`senderName`).
 - **"Leia minhas últimas mensagens"** → `wa_list_chats()` → `wa_read_messages({ chat, limit: 20 })` por chat relevante.
 - **"Tem áudio no grupo X? Me resume"** → `wa_resolve_contact({ q: "X" })` → confirme que
   é um só candidato (senão pergunte) → `wa_read_messages({ chat: jid, since: ... })` →
@@ -261,6 +264,11 @@ Grupos têm `maskedNumber: "grupo"`, nunca um número — grupo não tem telefon
 ## Limites honestos
 
 - Rate limit de **10 envios/hora**, global (não por chat).
+- **Histórico**: o daemon só tem os últimos 7 dias anteriores ao pareamento mais o que
+  chegou depois dele. Se a retenção de mensagens estiver ligada
+  (`WA_RETENTION_MESSAGES_DAYS`), mensagens antigas saem do banco. Se o humano perguntar
+  de algo mais antigo, diga que o daemon não tem, em vez de concluir que "não existe".
+- **Busca** só enxerga áudio e vídeo já transcritos por `wa_media`.
 - **1 draft ativo por chat.** Um segundo draft no mesmo chat falha com `DRAFT_ALREADY_PENDING` até o primeiro expirar, ser confirmado ou cancelado.
 - `confirmToken` **expira em 5 minutos** (`WA_DRAFT_TTL_MS`, default `300000`).
 - **Menção depende da lista de membros do grupo**, que o daemon sincroniza na conexão e

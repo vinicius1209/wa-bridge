@@ -10,12 +10,13 @@ import { fileURLToPath } from 'node:url';
 import fastifyStatic from '@fastify/static';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { Config } from '../config.js';
+import type { EventHub } from '../events/hub.js';
 import type { MediaProcessor } from '../media/processor.js';
 import type { Audit } from '../obs/audit.js';
 import type { Metrics } from '../obs/metrics.js';
 import type { SendGate } from '../send/gate.js';
 import { AppError } from '../send/errors.js';
-import type { Store } from '../store/store.js';
+import { toFtsQuery, type Store } from '../store/store.js';
 import type { CallStatus, DraftInput, Logger } from '../types.js';
 import type { WhatsAppConnection } from '../whatsapp/connection.js';
 import {
@@ -51,8 +52,12 @@ export interface ApiDeps {
   gate: SendGate;
   metrics: Metrics;
   audit: Audit;
+  events: EventHub;
   log: Logger;
 }
+
+/** Teto de resultados de `/search` por chamada. */
+const SEARCH_MAX_LIMIT = 100;
 
 const AGENT_HEADER = 'x-wa-agent';
 const AGENT_MAX_LEN = 48;
@@ -84,7 +89,7 @@ function resolveDashboardDir(): string {
 
 /** Monta a instância Fastify com todas as rotas do contrato. Quem chama `listen` é o `index.ts`. */
 export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
-  const { config, store, wa, media, gate, metrics, audit, log } = deps;
+  const { config, store, wa, media, gate, metrics, audit, events, log } = deps;
 
   const app = Fastify({
     logger: false,
@@ -177,6 +182,11 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
 
   // ------------------------------------------------------------------ rotas
 
+  // Streams SSE abertos seguram o `close` do HTTP para sempre: encerra antes.
+  app.addHook('preClose', async () => {
+    events.closeAll();
+  });
+
   /**
    * GET /health: único endpoint sem auth; usado por monitoramento, pelo script e pela
    * identidade do painel. Qualquer processo da máquina lê isto, então só vai o mínimo:
@@ -257,6 +267,53 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
     // `queryInt` recusa valor não numérico com 400; `Number()` cru mandaria NaN ao SQLite.
     const since = queryString(req.query, 'since') !== undefined ? queryInt(req.query, 'since', 0) : undefined;
     return { messages: store.listMessages({ chatJid: chat, limit, ...(since !== undefined ? { since } : {}) }) };
+  });
+
+  /**
+   * GET /search: busca textual (FTS5) no texto das mensagens e nas transcrições já
+   * feitas, mais recentes primeiro. `chat` e `since` restringem a busca.
+   */
+  app.get('/search', async (req) => {
+    const q = queryString(req.query, 'q');
+    if (!q || !toFtsQuery(q)) throw new AppError('VALIDATION', 400, '"q" é obrigatório');
+    const chat = queryString(req.query, 'chat');
+    const limit = Math.min(Math.max(queryInt(req.query, 'limit', 20), 1), SEARCH_MAX_LIMIT);
+    const since = queryString(req.query, 'since') !== undefined ? queryInt(req.query, 'since', 0) : undefined;
+    return {
+      hits: store.searchMessages({
+        query: q,
+        limit,
+        ...(chat ? { chatJid: chat } : {}),
+        ...(since !== undefined ? { since } : {}),
+      }),
+    };
+  });
+
+  /**
+   * GET /events: stream SSE de mensagens novas (evento `message`), com `ready` na
+   * conexão e keep-alive a cada 25s. `?from_me=true` inclui as próprias mensagens,
+   * `?chat=<jid>` filtra uma conversa. Histórico importado não passa por aqui.
+   */
+  app.get('/events', async (req, reply) => {
+    if (!events.hasRoom()) {
+      throw new AppError('TOO_MANY_STREAMS', 429, 'limite de streams de eventos abertos atingido');
+    }
+    const includeFromMe = queryBool(req.query, 'from_me', false);
+    const chatJid = queryString(req.query, 'chat') ?? null;
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Trace-Id': req.traceId,
+    });
+    const session = wa.getSessionState();
+    const detach = events.attach(reply.raw, { includeFromMe, chatJid }, {
+      version: config.version,
+      session: { state: session.state, since: session.since },
+    });
+    req.raw.on('close', detach);
+    return reply;
   });
 
   /** POST /media/:messageId — materializa (download/transcrição/keyframes) uma mídia já vista. */

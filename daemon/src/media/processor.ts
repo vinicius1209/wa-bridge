@@ -16,6 +16,7 @@ import type { Config } from '../config.js';
 import type { Store } from '../store/store.js';
 import type { WhatsAppConnection } from '../whatsapp/connection.js';
 import type { Logger, MediaArtifact, MediaKind } from '../types.js';
+import { ConcurrencyLimiter } from './limiter.js';
 
 /** Teto de tempo para qualquer chamada ao ffmpeg/ffprobe. */
 const FFMPEG_TIMEOUT_MS = 60_000;
@@ -149,6 +150,12 @@ export class MediaProcessor {
   private readonly config: Config;
   /** Trabalhos em voo por messageId, para colapsar chamadas concorrentes na mesma promise. */
   private readonly inFlight = new Map<string, Promise<MediaArtifact>>();
+  /**
+   * Teto de mídias processando ao mesmo tempo (`WA_MEDIA_CONCURRENCY`). Cada whisper
+   * carrega o modelo inteiro na memória e disputa a GPU: sem teto, um agente pedindo 30
+   * áudios de uma vez abria 30 processos.
+   */
+  private readonly limiter: ConcurrencyLimiter;
 
   constructor(deps: { wa: WhatsAppConnection; store: Store; log: Logger; home: string; config: Config }) {
     this.wa = deps.wa;
@@ -156,9 +163,13 @@ export class MediaProcessor {
     this.log = deps.log;
     this.home = deps.home;
     this.config = deps.config;
+    this.limiter = new ConcurrencyLimiter(deps.config.mediaConcurrency);
   }
 
-  /** Materializa a mídia de `messageId` em disco, idempotente e sem baixar duas vezes em paralelo. */
+  /**
+   * Materializa a mídia de `messageId` em disco, idempotente e sem baixar duas vezes em
+   * paralelo. Passado o teto de concorrência, a chamada espera na fila.
+   */
   async materialize(
     messageId: string,
     opts: { transcribe?: boolean; frames?: boolean } = {},
@@ -166,7 +177,7 @@ export class MediaProcessor {
     const existing = this.inFlight.get(messageId);
     if (existing) return existing;
 
-    const job = this.doMaterialize(messageId, opts).finally(() => {
+    const job = this.limiter.run(() => this.doMaterialize(messageId, opts)).finally(() => {
       this.inFlight.delete(messageId);
     });
     this.inFlight.set(messageId, job);
@@ -179,6 +190,9 @@ export class MediaProcessor {
     opts: { transcribe?: boolean; frames?: boolean },
   ): Promise<MediaArtifact> {
     const cached = this.store.getMedia(messageId);
+    // Áudio cujo arquivo a retenção apagou: o que o agente usa é a transcrição, e ela
+    // ficou no banco. Não há por que baixar de novo.
+    if (cached?.error === 'PRUNED' && cached.kind === 'audio' && cached.transcript !== null) return cached;
     if (cached && cached.path.length > 0 && existsSync(cached.path) && isSoftError(cached.error)) {
       if (cached.error === null) {
         const wantTranscript =
@@ -527,6 +541,12 @@ export class MediaProcessor {
 
   /** Persiste o artifact (sempre, inclusive em erro) e loga o desfecho. */
   private finish(artifact: MediaArtifact, state: 'ready' | 'failed' | 'expired'): MediaArtifact {
+    // Uma transcrição conhecida nunca se perde: quando a retenção apagou o arquivo e o
+    // download de novo falha (ex.: MEDIA_EXPIRED), o texto que já existia continua.
+    if (artifact.transcript === null) {
+      const previous = this.store.getMedia(artifact.messageId);
+      if (previous?.transcript) artifact.transcript = previous.transcript;
+    }
     // store.saveMedia é quem mantém messages.media_state coerente com o artifact
     // (ready/failed/expired) — não há método separado no contrato para isso.
     this.store.saveMedia(artifact);

@@ -46,6 +46,19 @@ export interface StoredMessage {
   senderPhoneJid?: string | null;
 }
 
+/** Onde a busca casou: no texto da mensagem ou na transcrição do áudio/vídeo dela. */
+export type SearchSource = 'text' | 'transcript';
+
+/** Um resultado de `GET /search`: a mensagem inteira mais o trecho que casou. */
+export interface SearchHit {
+  message: StoredMessage;
+  /** Nome da conversa (grupo ou contato), quando conhecido. */
+  chatName: string | null;
+  source: SearchSource;
+  /** Trecho em volta do termo, com o termo entre « ». */
+  snippet: string;
+}
+
 /** Resumo de uma conversa para listagem. */
 export interface ChatSummary {
   jid: string;
@@ -119,6 +132,13 @@ export interface MediaArtifact {
   framePaths: string[];
   viewOnce: boolean;
   error: string | null;
+}
+
+/** Arquivos em disco de uma mídia materializada, para a retenção apagar. */
+export interface MediaFiles {
+  messageId: string;
+  path: string;
+  framePaths: string[];
 }
 
 // ----------------------------------------------------------------- contatos

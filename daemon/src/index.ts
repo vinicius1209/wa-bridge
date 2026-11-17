@@ -3,11 +3,13 @@
  */
 import { loadConfig, restrictStateDirs } from './config.js';
 import { createApi } from './api/server.js';
+import { EventHub } from './events/hub.js';
 import { MediaProcessor } from './media/processor.js';
 import { Audit } from './obs/audit.js';
 import { createLogger } from './obs/log.js';
 import { Metrics } from './obs/metrics.js';
 import { SendGate } from './send/gate.js';
+import { RETENTION_INTERVAL_MS, runRetention } from './store/retention.js';
 import { Store } from './store/store.js';
 import { WhatsAppConnection } from './whatsapp/connection.js';
 
@@ -18,21 +20,23 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger({ level: config.logLevel, file: config.logFile });
 
-  log.info({ home: config.home, port: config.port }, 'iniciando wa-daemon');
+  log.info({ home: config.home, port: config.port, version: config.version }, 'iniciando wa-daemon');
   for (const warning of restrictStateDirs(config)) log.warn(warning);
 
   // 1. Persistência primeiro: todo o resto depende do store.
   const store = new Store(config.dbPath);
   store.migrate();
+  log.info({ schema: store.schemaVersion() }, 'banco migrado');
   const orphans = store.failOrphanSends(Date.now());
   if (orphans > 0) log.warn({ orphans }, 'envios interrompidos pelo último encerramento marcados como falha');
 
   // 2. Observabilidade antes do WhatsApp, para capturar eventos de pareamento.
   const metrics = new Metrics(store);
   const audit = new Audit(store);
+  const events = new EventHub();
 
   // 3. Conexão WhatsApp. Única dona das credenciais e do socket.
-  const wa = new WhatsAppConnection({ store, log, metrics, home: config.home });
+  const wa = new WhatsAppConnection({ store, log, metrics, home: config.home, historyDays: config.historyDays });
 
   // O `Metrics` não recebe a conexão no construtor (dependência circular), então o estado
   // da sessão chega por provider. Sem este wiring o dashboard mostra a sessão sempre fechada.
@@ -43,11 +47,21 @@ async function main(): Promise<void> {
   const gate = new SendGate({ wa, store, log, metrics, audit, config });
 
   // 5. HTTP só sobe depois que tudo existe, para nunca servir 500 por dependência nula.
-  const api = await createApi({ config, store, wa, media, gate, metrics, audit, log });
+  const api = await createApi({ config, store, wa, media, gate, metrics, audit, events, log });
 
+  // Mensagem nova (ao vivo ou da fila offline) vai para o stream `/events`. Histórico
+  // importado no pareamento não passa por `onMessage`.
   wa.onMessage((message) => {
-    log.debug({ chat: message.chatJid, type: message.type }, 'mensagem recebida');
+    events.publishMessage(message, store.getChatName(message.chatJid));
   });
+
+  // Retenção no boot e a cada 6h. Falha aqui nunca derruba o daemon.
+  const retention = (): void => {
+    runRetention({ store, log, config }).catch((error: unknown) => log.error({ error }, 'falha na retenção'));
+  };
+  retention();
+  const retentionTimer = setInterval(retention, RETENTION_INTERVAL_MS);
+  retentionTimer.unref();
 
   await wa.connect();
   await api.listen({ host: config.host, port: config.port });
@@ -67,6 +81,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }, SHUTDOWN_TIMEOUT_MS).unref();
 
+    clearInterval(retentionTimer);
     try {
       await api.close();
     } catch (error) {

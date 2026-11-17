@@ -5,6 +5,7 @@
 #   ./wa-bridge setup [--model NOME | --no-model]   instala deps, builda e baixa o modelo
 #   ./wa-bridge start|stop|restart|status|logs       ciclo de vida do daemon
 #   ./wa-bridge service install|uninstall|status     daemon como serviço do macOS (launchd)
+#   ./wa-bridge events [--from-me] [--chat JID]      acompanha as mensagens novas (stream)
 #   ./wa-bridge open                                 abre o painel já autenticado
 #   ./wa-bridge qr                                   salva e abre o QR de pareamento (PNG)
 #   ./wa-bridge pair [--yes]                         descarta a sessão e gera QR novo
@@ -501,6 +502,25 @@ cmd_logs() {
   tail -f "${files[@]}"
 }
 
+# Acompanha o stream de mensagens novas (GET /events, Server-Sent Events).
+cmd_events() {
+  local query="" sep="?"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-me) query+="${sep}from_me=true"; sep="&"; shift ;;
+      --chat) query+="${sep}chat=${2:?--chat precisa de um JID}"; sep="&"; shift 2 ;;
+      *) fail "opção desconhecida: $1 (use --from-me e/ou --chat JID)"; return 1 ;;
+    esac
+  done
+  local token; token="$(read_token)" || { fail "token não existe, suba o daemon: ./wa-bridge start"; return 1; }
+  [[ -n "$(health_json)" ]] || { fail "daemon não está no ar, rode: ./wa-bridge start"; return 1; }
+  echo "escutando mensagens novas em $URL/events (Ctrl+C para sair)" >&2
+  # O header vai por stdin (`-H @-`): na linha de comando, o token ficaria visível no `ps`
+  # durante todo o tempo em que o stream estiver aberto.
+  printf 'Authorization: Bearer %s\nX-WA-Agent: cli\n' "$token" \
+    | curl -fsSN -H @- "$URL/events$query"
+}
+
 # ---------------------------------------------------------------- pareamento
 
 cmd_pair() {
@@ -660,7 +680,7 @@ cmd_doctor() {
 }
 
 usage() {
-  sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-status}"
@@ -673,6 +693,7 @@ case "$cmd" in
   status)     cmd_status ;;
   logs)       cmd_logs ;;
   service)    cmd_service "$@" ;;
+  events)     cmd_events "$@" ;;
   pair)       cmd_pair "$@" ;;
   qr)         cmd_qr ;;
   open)       cmd_open ;;
