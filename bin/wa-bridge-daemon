@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# Sobe o daemon em primeiro plano. É isto que o serviço (launchd) executa, e não o node
+# direto, por dois motivos:
+#
+# - o Node é resolvido a cada boot (Node 24+, sem depender do PATH): trocar de versão no
+#   nvm não quebra o serviço, como acontecia com o caminho do node fixado no plist;
+# - o `.env` da raiz é lido aqui, porque o launchd não passa pelo script `./wa-bridge`.
+#   As variáveis do plist (WA_BRIDGE_HOME, WA_BRIDGE_PORT) ganham do `.env`.
+#
+# `exec` troca o processo: o launchd manda o SIGTERM direto para o Node, que encerra
+# a API, o socket do WhatsApp e o banco de forma limpa.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$HERE/.." && pwd)"
+ENTRY="$REPO_DIR/daemon/dist/index.js"
+
+# shellcheck source=./load-dotenv.sh
+source "$HERE/load-dotenv.sh"
+load_dotenv "$REPO_DIR/.env"
+
+# shellcheck source=./resolve-node.sh
+source "$HERE/resolve-node.sh"
+NODE_BIN="$(WA_NODE_MIN_MAJOR=24 resolve_node)" || exit 1
+
+if [[ ! -f "$ENTRY" ]]; then
+  echo "wa-bridge: $ENTRY não existe, rode './wa-bridge setup' em $REPO_DIR" >&2
+  exit 1
+fi
+
+cd "$REPO_DIR/daemon"
+exec "$NODE_BIN" "$ENTRY" "$@"

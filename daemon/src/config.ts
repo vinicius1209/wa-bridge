@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { VERSION } from './version.js';
 
 /**
  * Identidade humana da instância, lida de `$WA_BRIDGE_HOME/account.json` (opcional).
@@ -152,7 +153,7 @@ export function loadConfig(): Config {
     draftTtlMs: Number(process.env.WA_DRAFT_TTL_MS ?? 300_000),
     sendsPerHour: Number(process.env.WA_SENDS_PER_HOUR ?? 10),
     logLevel: process.env.LOG_LEVEL ?? 'info',
-    version: '0.1.0',
+    version: VERSION,
     account: loadAccount(home),
   };
 }

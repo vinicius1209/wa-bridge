@@ -45,11 +45,13 @@ Nada de ORM, nada de framework de frontend. Zero dependência nativa. Docker é 
 
 ```
 wa-bridge/
-├── wa-bridge                     script de instalação e controle (setup/start/stop/...)
-├── bin/                          wrapper do MCP + resolução do Node sem depender do PATH
+├── wa-bridge                     script de instalação e controle (setup/start/stop/service/...)
+├── bin/                          wrapper do MCP, wrapper do daemon (o que o launchd roda),
+│                                 resolução do Node sem depender do PATH e leitura do .env
 ├── daemon/src/
 │   ├── types.ts                  tipos compartilhados (fonte da verdade)
 │   ├── config.ts                 env e paths
+│   ├── version.ts                versão, lida do package.json da raiz (fonte única)
 │   ├── index.ts                  bootstrap e ordem de inicialização
 │   ├── whatsapp/                 conexão Baileys
 │   ├── store/                    SQLite
@@ -57,11 +59,15 @@ wa-bridge/
 │   ├── api/                      HTTP (Fastify)
 │   ├── send/                     gate de envio, delay humano, menções, blocklist
 │   └── obs/                      log, métricas, auditoria
-├── mcp/src/                      shim MCP (stdio → HTTP)
+├── mcp/src/                      shim MCP (stdio → HTTP); `version.ts` lê a mesma versão
 ├── dashboard/                    painel (HTML/CSS/JS sem build)
 ├── docker/, Dockerfile, docker-compose.yml   caminho opcional via Docker
 └── docs/                         ARQUITETURA, INSTALACAO, LLMS, OPERACAO
 ```
+
+**Versão:** a única fonte é o campo `version` do `package.json` da raiz. Daemon
+(`daemon/src/version.ts`) e shim (`mcp/src/version.ts`) leem `../../package.json` a partir
+de `src/` ou `dist/`; os `package.json` dos workspaces não têm `version`.
 
 ## Diretório de estado (runtime)
 
