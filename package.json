@@ -1,6 +1,7 @@
 {
   "name": "wa-bridge",
   "private": true,
+  "version": "0.1.0",
   "type": "module",
   "description": "Ponte entre o seu WhatsApp e agentes de código (Claude Code, Codex, opencode...): daemon único + shim MCP, com envio atrás de confirmação humana",
   "license": "MIT",

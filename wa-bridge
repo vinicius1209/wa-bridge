@@ -4,6 +4,7 @@
 #
 #   ./wa-bridge setup [--model NOME | --no-model]   instala deps, builda e baixa o modelo
 #   ./wa-bridge start|stop|restart|status|logs       ciclo de vida do daemon
+#   ./wa-bridge service install|uninstall|status     daemon como serviço do macOS (launchd)
 #   ./wa-bridge open                                 abre o painel já autenticado
 #   ./wa-bridge qr                                   salva e abre o QR de pareamento (PNG)
 #   ./wa-bridge pair [--yes]                         descarta a sessão e gera QR novo
@@ -13,6 +14,8 @@
 # Mantém UMA instância por WA_BRIDGE_HOME: duas sessões Baileys com a mesma credencial
 # derrubam a conta do WhatsApp com `device_removed` e exigem novo pareamento. Por isso
 # todo `start` checa se já há daemon de pé (pidfile OU porta ocupada) antes de subir.
+# Com o serviço instalado, start/stop/restart viram comandos do launchd: o script nunca
+# sobe um processo próprio ao lado do serviço.
 #
 # Variáveis podem vir do ambiente ou de um `.env` na raiz do repo (ver .env.example).
 # O ambiente sempre ganha do `.env`: `WA_BRIDGE_PORT=7789 ./wa-bridge start` funciona
@@ -22,25 +25,9 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Carrega `.env` sem sobrescrever o que já veio do ambiente. Não usamos `source` porque
-# ele executaria o arquivo como shell e sobrescreveria variáveis já definidas.
-load_dotenv() {
-  local file="$REPO_DIR/.env" line key value
-  [[ -f "$file" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line#"${line%%[![:space:]]*}"}"
-    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
-    key="${line%%=*}"; value="${line#*=}"
-    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-    value="${value%%[[:space:]]#*}"                     # comentário no fim da linha
-    value="${value%"${value##*[![:space:]]}"}"          # espaços no fim
-    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
-    value="${value/#\~/$HOME}"
-    [[ -n "${!key+x}" || -z "$value" ]] && continue
-    export "$key=$value"
-  done <"$file"
-}
-load_dotenv
+# shellcheck source=./bin/load-dotenv.sh
+source "$REPO_DIR/bin/load-dotenv.sh"
+load_dotenv "$REPO_DIR/.env"
 
 HOME_DIR="${WA_BRIDGE_HOME:-$HOME/.wa-bridge}"
 HOME_DIR="${HOME_DIR/#\~/$HOME}"
@@ -52,6 +39,14 @@ OUT_FILE="$HOME_DIR/logs/stdout.log"
 URL="http://127.0.0.1:$PORT"
 DEFAULT_MODEL_NAME="large-v3-turbo"
 MODEL_BASE_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+
+# Serviço launchd: um por instância. A instância padrão (porta 7788) usa o rótulo
+# histórico `local.wa-bridge`; as outras ganham a porta no nome.
+SERVICE_LABEL="local.wa-bridge"
+[[ "$PORT" != "7788" ]] && SERVICE_LABEL="local.wa-bridge.$PORT"
+PLIST_PATH="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+SERVICE_DOMAIN="gui/$(id -u)"
+SERVICE_TARGET="$SERVICE_DOMAIN/$SERVICE_LABEL"
 
 # shellcheck source=./bin/resolve-node.sh
 source "$REPO_DIR/bin/resolve-node.sh"
@@ -120,6 +115,29 @@ docker_container_running() {
   command -v docker >/dev/null || return 1
   docker ps --filter "name=^wa-bridge$" --filter "status=running" --format '{{.Names}}' 2>/dev/null \
     | grep -q . || return 1
+}
+
+# Serviço launchd: plist presente / carregado no launchd agora.
+service_installed() { is_macos && [[ -f "$PLIST_PATH" ]]; }
+service_loaded() { is_macos && launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; }
+
+# Espera o /health responder (N tentativas de 0,5s). Verdadeiro se respondeu.
+wait_health() {
+  local tries="${1:-40}"
+  for _ in $(seq 1 "$tries"); do
+    sleep 0.5
+    [[ -n "$(health_json)" ]] && return 0
+  done
+  return 1
+}
+
+# Espera a porta ficar livre (o processo anterior terminar de encerrar).
+wait_port_free() {
+  for _ in $(seq 1 40); do
+    [[ -z "$(running_pid)" ]] && return 0
+    sleep 0.5
+  done
+  return 1
 }
 
 # ------------------------------------------------------------------- setup
@@ -209,6 +227,11 @@ cmd_start() {
     return 1
   fi
 
+  if service_installed; then
+    service_start
+    return
+  fi
+
   local pid; pid="$(running_pid)"
   if [[ -n "$pid" ]]; then
     warn "daemon já está rodando (pid $pid) — nada a fazer"
@@ -252,6 +275,20 @@ cmd_start() {
 }
 
 cmd_stop() {
+  if service_loaded; then
+    bold "parando o serviço ($SERVICE_LABEL)..."
+    # `bootout` descarrega o serviço: sem isto o KeepAlive subiria outro processo na hora.
+    launchctl bootout "$SERVICE_TARGET" 2>/dev/null || true
+    wait_port_free || warn "o processo ainda não encerrou, confira com './wa-bridge status'"
+    ok "parado. O serviço volta no próximo login ou com './wa-bridge start'"
+    [[ -n "$(running_pid)" ]] && stop_process
+    return 0
+  fi
+  stop_process
+}
+
+# Para o daemon que o próprio script subiu (fora do serviço).
+stop_process() {
   local pid; pid="$(running_pid)"
   if [[ -z "$pid" ]]; then
     warn "daemon já está parado"
@@ -271,13 +308,177 @@ cmd_stop() {
   ok "parado (forçado)"
 }
 
-cmd_restart() { cmd_stop; sleep 1; cmd_start; }
+cmd_restart() {
+  if service_loaded; then
+    local old pid; old="$(running_pid)"
+    bold "reiniciando o serviço ($SERVICE_LABEL)..."
+    # `kickstart -k` encerra e sobe de novo pelo próprio launchd, que nunca deixa dois
+    # processos do mesmo serviço rodando juntos.
+    launchctl kickstart -k "$SERVICE_TARGET"
+    for _ in $(seq 1 60); do
+      sleep 0.5
+      pid="$(running_pid)"
+      if [[ -n "$pid" && "$pid" != "$old" && -n "$(health_json)" ]]; then
+        ok "serviço reiniciado (pid $pid)"
+        cmd_status
+        return 0
+      fi
+    done
+    fail "o serviço não voltou em 30s, veja: ./wa-bridge logs"
+    return 1
+  fi
+  cmd_stop; sleep 1; cmd_start
+}
+
+# ------------------------------------------------------------------- serviço
+
+# Sobe pelo launchd: carrega o plist se preciso e garante o processo de pé.
+service_start() {
+  if ! service_loaded; then
+    # Daemon antigo do script na mesma porta: o launchd subiria um segundo processo, que
+    # chega a abrir a sessão do WhatsApp antes de falhar na porta. Para o antigo antes.
+    [[ -n "$(running_pid)" ]] && stop_process
+    launchctl bootstrap "$SERVICE_DOMAIN" "$PLIST_PATH"
+  else
+    # Sem `-k`: se já está rodando, não faz nada.
+    launchctl kickstart "$SERVICE_TARGET" >/dev/null 2>&1 || true
+  fi
+  if wait_health 60; then
+    ok "daemon no ar pelo serviço ($SERVICE_LABEL)"
+    cmd_status
+    return 0
+  fi
+  fail "o serviço não respondeu em 30s, veja: ./wa-bridge logs"
+  tail -20 "$HOME_DIR/logs/launchd.err.log" >&2 2>/dev/null || true
+  return 1
+}
+
+# Escreve o plist do serviço. Quem roda é o bin/wa-bridge-daemon, que resolve o Node e lê o .env.
+write_plist() {
+  mkdir -p "$(dirname "$PLIST_PATH")"
+  cat >"$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Gerado por './wa-bridge service install'. Para mudar, edite o .env e rode o comando de novo. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$SERVICE_LABEL</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>$REPO_DIR/bin/wa-bridge-daemon</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>$REPO_DIR/daemon</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>WA_BRIDGE_HOME</key>
+    <string>$HOME_DIR</string>
+    <key>WA_BRIDGE_PORT</key>
+    <string>$PORT</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>$HOME_DIR/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME_DIR/logs/launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+service_install() {
+  if ! is_macos; then
+    fail "o serviço automático só existe no macOS (launchd). No Linux, use o systemd: docs/OPERACAO.md"
+    return 1
+  fi
+  if docker_container_running; then
+    fail "há um container wa-bridge rodando, não instale o serviço junto (dividiriam ~/.wa-bridge/auth)."
+    return 1
+  fi
+  [[ -f "$REPO_DIR/daemon/dist/index.js" ]] || { fail "build ausente, rode primeiro: ./wa-bridge setup"; return 1; }
+  node_bin >/dev/null || { fail "Node 24 ou mais novo não encontrado"; return 1; }
+
+  if service_loaded; then
+    bold "atualizando o serviço ($SERVICE_LABEL)..."
+    launchctl bootout "$SERVICE_TARGET" 2>/dev/null || true
+  else
+    bold "instalando o serviço ($SERVICE_LABEL)..."
+  fi
+  wait_port_free || true
+  # Daemon subido pelo script: precisa sair antes, para nunca haver dois na mesma credencial.
+  [[ -n "$(running_pid)" ]] && stop_process
+  wait_port_free || { fail "a porta $PORT continua ocupada; confira com: lsof -nP -iTCP:$PORT"; return 1; }
+
+  write_plist
+  plutil -lint "$PLIST_PATH" >/dev/null || { fail "plist inválido em $PLIST_PATH"; return 1; }
+  launchctl bootstrap "$SERVICE_DOMAIN" "$PLIST_PATH"
+  if wait_health 60; then
+    ok "serviço instalado: sobe sozinho no login e reinicia se cair"
+    echo "   plist: $PLIST_PATH"
+    cmd_status
+    return 0
+  fi
+  fail "o serviço não respondeu em 30s, veja: ./wa-bridge logs"
+  tail -20 "$HOME_DIR/logs/launchd.err.log" >&2 2>/dev/null || true
+  return 1
+}
+
+service_uninstall() {
+  if service_loaded; then
+    bold "removendo o serviço ($SERVICE_LABEL)..."
+    launchctl bootout "$SERVICE_TARGET" 2>/dev/null || true
+    wait_port_free || warn "o processo ainda não encerrou, confira com './wa-bridge status'"
+  fi
+  if [[ -f "$PLIST_PATH" ]]; then
+    rm -f "$PLIST_PATH"
+    ok "serviço removido; o daemon não sobe mais sozinho (use './wa-bridge start')"
+  else
+    warn "serviço não estava instalado"
+  fi
+}
+
+service_status() {
+  echo
+  bold "serviço $SERVICE_LABEL"
+  if ! is_macos; then warn "só existe no macOS (launchd); no Linux veja docs/OPERACAO.md"; return 0; fi
+  if service_loaded; then ok "carregado no launchd"
+  elif service_installed; then warn "instalado, mas descarregado (./wa-bridge start)"
+  else warn "não instalado (./wa-bridge service install)"; fi
+  [[ -f "$PLIST_PATH" ]] && echo "   plist: $PLIST_PATH"
+  local node
+  if node="$(node_bin 2>/dev/null)"; then echo "   node:  $node ($("$node" -v))"; fi
+  echo
+}
+
+cmd_service() {
+  local sub="${1:-status}"
+  case "$sub" in
+    install)   service_install ;;
+    uninstall) service_uninstall ;;
+    status)    service_status ;;
+    *) fail "uso: ./wa-bridge service install|uninstall|status"; return 1 ;;
+  esac
+}
 
 cmd_status() {
   local pid state; pid="$(running_pid)"; state="$(session_state)"
   echo
   bold "wa-bridge ($HOME_DIR, porta $PORT)"
   if [[ -n "$pid" ]]; then ok "processo: rodando (pid $pid)"; else fail "processo: parado"; fi
+  if service_loaded; then ok "serviço: launchd ($SERVICE_LABEL)"
+  elif service_installed; then warn "serviço: instalado, mas descarregado"; fi
   case "$state" in
     open)       ok "whatsapp: conectado" ;;
     pairing)    warn "whatsapp: aguardando pareamento — rode './wa-bridge open' e escaneie o QR" ;;
@@ -290,7 +491,12 @@ cmd_status() {
   echo
 }
 
-cmd_logs() { tail -f "$LOG_FILE" "$OUT_FILE"; }
+cmd_logs() {
+  local files=() f
+  for f in "$LOG_FILE" "$OUT_FILE" "$HOME_DIR/logs/launchd.err.log"; do [[ -f "$f" ]] && files+=("$f"); done
+  [[ ${#files[@]} -gt 0 ]] || { warn "nenhum log ainda em $HOME_DIR/logs"; return 0; }
+  tail -f "${files[@]}"
+}
 
 # ---------------------------------------------------------------- pareamento
 
@@ -448,7 +654,7 @@ cmd_doctor() {
 }
 
 usage() {
-  sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-status}"
@@ -460,6 +666,7 @@ case "$cmd" in
   restart)    cmd_restart ;;
   status)     cmd_status ;;
   logs)       cmd_logs ;;
+  service)    cmd_service "$@" ;;
   pair)       cmd_pair "$@" ;;
   qr)         cmd_qr ;;
   open)       cmd_open ;;

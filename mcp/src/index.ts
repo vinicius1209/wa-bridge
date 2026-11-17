@@ -10,6 +10,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { MEDIA_TIMEOUT_MS, requestDaemon, resolveAccountLabel, WaBridgeClientError } from './client.js';
 import { redactChats, redactMessages } from './redact.js';
+import { VERSION } from './version.js';
 
 /** Serializa qualquer payload de sucesso como JSON delimitado — nunca prosa concatenada. */
 function okResult(payload: unknown): CallToolResult {
@@ -55,7 +56,7 @@ function safeHandler<T>(fn: (args: T) => Promise<unknown>): (args: T) => Promise
 const accountLabel = resolveAccountLabel();
 
 const server = new McpServer(
-  { name: 'wa-bridge', version: '0.1.0' },
+  { name: 'wa-bridge', version: VERSION },
   accountLabel
     ? {
         instructions:

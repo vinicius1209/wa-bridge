@@ -106,7 +106,8 @@ segurança).
 | Comando | O que faz |
 |---|---|
 | `./wa-bridge setup [--model NOME \| --no-model]` | instala dependências, compila e baixa o modelo do whisper |
-| `./wa-bridge start` / `stop` / `restart` | sobe, para e reinicia o daemon |
+| `./wa-bridge start` / `stop` / `restart` | sobe, para e reinicia o daemon (pelo launchd, se o serviço estiver instalado) |
+| `./wa-bridge service install\|uninstall\|status` | daemon como serviço do macOS: sobe no login e reinicia se cair |
 | `./wa-bridge status` | processo e estado da sessão do WhatsApp |
 | `./wa-bridge open` | abre o painel já autenticado |
 | `./wa-bridge qr` | salva o QR de pareamento como PNG e abre |
@@ -116,8 +117,10 @@ segurança).
 | `./wa-bridge token` | copia o token da API |
 | `./wa-bridge doctor` | diagnóstico completo da instalação |
 
-O daemon **não sobe sozinho** depois de reiniciar o computador. Para isso, rode como
-serviço (launchd no Mac, systemd no Linux): veja [`docs/OPERACAO.md`](docs/OPERACAO.md).
+O daemon **não sobe sozinho** depois de reiniciar o computador. No Mac,
+`./wa-bridge service install` resolve (launchd); no Linux, use o systemd: veja
+[`docs/OPERACAO.md`](docs/OPERACAO.md). Com o serviço instalado, `start`, `stop` e
+`restart` passam a falar com o launchd, e o script nunca sobe um processo ao lado dele.
 
 ## Configuração
 
