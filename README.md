@@ -50,8 +50,9 @@ O que vem junto:
 - **Gate de envio**: rascunho → humano aprova → envio. Avisos para número nunca
   contatado, horário de silêncio e grupo; limite de 10 envios por hora; 1 rascunho por
   conversa; blocklist.
-- **Digitação simulada**: o envio aparece como "digitando...", quebrado em balões, com
-  uma janela para cancelar antes de terminar.
+- **Ritmo humano no envio**: quebrado em balões, com o tempo de leitura e de digitação
+  de uma pessoa entre eles e uma janela para cancelar antes de terminar. Não mostra
+  "digitando": isso deixava o aparelho em uso e o celular parava de notificar.
 - **Painel** em `http://127.0.0.1:7788/dashboard/` (`./wa-bridge open`): sessão e QR de
   pareamento, envios usados na hora e horário de silêncio, rascunhos esperando aprovação
   (dá para descartar), envios em andamento (dá para cancelar), mensagens chegando ao vivo,
@@ -184,8 +185,9 @@ falando. Nunca compartilhe `auth/` entre instâncias.
 - **API só em `127.0.0.1`**, com token Bearer. O painel estático abre sem token, mas
   todo dado exige token.
 - **Auditoria append-only** de todo rascunho, envio, bloqueio e cancelamento.
-- **Nunca aparece online.** O daemon conecta sem se marcar como disponível e, ao enviar,
-  só mostra "digitando" na conversa. Um aparelho online faz o celular parar de notificar.
+- **Nunca aparece online.** O daemon conecta sem se marcar como disponível, não mostra
+  "digitando" e avisa que está offline de novo depois de cada envio, reação, edição e
+  leitura. Um aparelho em uso faz o celular parar de notificar.
 - **Limites de volume**: 10 envios por hora, 40 por dia, 30s entre envios para a mesma
   conversa e 3 conversas novas por dia, além de respeitar a cota de conversas novas que o
   próprio WhatsApp informa. Tudo ajustável no `.env`.

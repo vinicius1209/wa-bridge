@@ -42,7 +42,7 @@ before(() => {
   const wa = {
     getGroupParticipants: async () => [],
     buildQuoted: () => undefined,
-    setPresence: async () => {},
+    markOffline: async () => {},
     getNewChatQuota: () => null,
     sendText: async (_jid: string, text: string) => {
       enviados.push(text);

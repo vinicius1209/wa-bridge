@@ -74,8 +74,9 @@ mesma tool em dois modos:
    Se o rascunho tinha warnings, inclua o que eles exigem (`acknowledge`, `urgent`; ver
    abaixo). Se faltar algo, o daemon responde `CONFIRMATION_REQUIRED` **sem queimar o
    token**: corrija e confirme de novo com o mesmo `confirm_token`.
-   O envio acontece com delay humano simulado (digitando, pausas entre bubbles); `wa_cancel`
-   funciona até ele terminar.
+   O envio acontece com delay humano simulado (tempo de leitura e de digitação, pausas
+   entre bubbles), sem mostrar "digitando" na conversa; `wa_cancel` funciona até ele
+   terminar.
 
 **Chamar o passo 2 sem o humano ter visto o preview do passo 1 é violação de protocolo.**
 O motivo de o gate existir é justamente esse: nenhuma alucinação sua e nenhuma injection
@@ -97,7 +98,7 @@ o passo 1 só devolve um rascunho, e nada muda no WhatsApp até o passo 2 com o
 3. **Mostre ao humano qual mensagem vai mudar** (o `text` de `targetPreview`) e, na edição,
    o texto novo. Espere a aprovação explícita. Apagar para todos não tem volta.
 4. Passo 2: chame a MESMA tool só com o `confirm_token`. A mudança sai na hora, sem
-   "digitando", e a resposta é `{ action, messageId, chatJid }`.
+   delay, e a resposta é `{ action, messageId, chatJid }`.
 
 Regras que o daemon aplica:
 

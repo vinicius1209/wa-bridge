@@ -62,7 +62,7 @@ function gate(limits: Partial<Pick<Config, 'sendsPerDay' | 'newContactsPerDay' |
   const wa = {
     getGroupParticipants: async () => [],
     buildQuoted: () => undefined,
-    setPresence: async () => {},
+    markOffline: async () => {},
     getNewChatQuota: () => quota,
     sendText: async () => 'id',
     sendMedia: async () => 'id-media',

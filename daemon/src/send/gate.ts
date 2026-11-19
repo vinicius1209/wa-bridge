@@ -837,7 +837,6 @@ export class SendGate {
           this.finishAsCancelled(sendId, jid, agent, traceId, sentIds);
           return;
         }
-        await this.wa.setPresence(jid, 'composing');
         const mediaId = await this.wa.sendMedia(
           jid,
           payload.mediaPath,
@@ -854,7 +853,9 @@ export class SendGate {
         this.store.updateSend(sendId, { stage: 'typing' });
         const plan = compressPlan(planDelay(payload.bubbles), this.config.sendMaxDelayMs);
         await executePlan(plan, {
-          presence: (p) => this.wa.setPresence(jid, p),
+          // Só o tempo do plano: sem "digitando" nem assinatura de presença, que deixavam
+          // o aparelho em uso e o celular sem notificação (ver `markOffline`).
+          presence: async () => {},
           shouldAbort: () => abortState.abort,
           send: async (bubble) => {
             this.store.updateSend(sendId, { stage: 'sending' });
@@ -913,9 +914,9 @@ export class SendGate {
       });
     } finally {
       this.abortFlags.delete(sendId);
-      // Envio só de mídia (ou que falhou no meio) não passa pelo fim do plano: encerra o
-      // "digitando" aqui. Melhor esforço, sem socket não há o que encerrar.
-      await this.wa.setPresence(jid, 'paused').catch(() => {});
+      // Todo envio, inclusive o que falhou no meio, termina avisando offline: enviar deixa o
+      // aparelho em uso, e aí o celular do usuário para de notificar.
+      await this.wa.markOffline().catch(() => {});
     }
   }
 
